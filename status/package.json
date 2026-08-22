@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Publishes status.json for relaxy.xyz: the Pi's own vitals, plus where Relaxy! is currently running (read from the `hosts` registry in MongoDB). Drop-in replacement for additions/status-writer.sh.",
+  "description": "Publishes status.json for relaxy.xyz",
   "main": "main.mjs",
   "scripts": {
     "start": "node main.mjs",
