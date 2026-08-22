@@ -1,0 +1,6 @@
+#!/bin/sh
+exec 2>&1
+
+/home/mattfor/relaxy/additions/bin/zram-swap start || exit 1
+
+exec sleep infinity

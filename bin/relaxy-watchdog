@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+CONFIG_FILE="${CONFIG_FILE:-/etc/relaxy-watchdog.conf}"
+
+WATCHDOG_DEV="/dev/watchdog"
+STATE_FILE="/run/relaxy-watchdog.json"
+VERDICT_FILE="/run/relaxy-watchdog.verdict"
+
+ARM_REBOOT=0
+
+PET_INTERVAL=5
+CHECK_INTERVAL=15
+
+FAIL_THRESHOLD=4
+
+GRACE_SECONDS=600
+
+STARTUP_DELAY_SECONDS=30
+
+REBOOT_GRACE_SECONDS=90
+
+REMEDIATE_LIMIT=2
+
+SSH_PORT=22
+DNS_PROBE_NAME="relaxy.xyz"
+MIN_MEM_AVAILABLE_KB=131072
+MAX_LOADAVG=40
+SERVICE_USER=mattfor
+
+[ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+GATES="dns filesystem ssh memory load fork"
+
+plog()
+{
+    printf '%(%Y-%m-%d %H:%M:%S)T [%s] [petter] %s\n' -1 "$1" "$2"
+}
+
+clog()
+{
+    local level="$1"; shift
+    local message="$1"; shift
+    local priority="${1:-notice}"
+
+    printf '%(%Y-%m-%d %H:%M:%S)T [%s] [checker] %s\n' -1 "$level" "$message"
+    logger -t relaxy-watchdog -p "daemon.${priority}" -- "$message" 2>/dev/null || true
+}
+
+uptime_seconds()
+{
+    local up
+    read -r up _ < /proc/uptime
+    printf '%d' "${up%.*}"
+}
+
+if [ ! -c "$WATCHDOG_DEV" ]; then
+    printf 'relaxy-watchdog: %s is not a character device - is bcm2835_wdt loaded?\n' "$WATCHDOG_DEV" >&2
+    exit 1
+fi
+
+exec 9<>"$WATCHDOG_DEV" || {
+    printf 'relaxy-watchdog: cannot open %s (need root)\n' "$WATCHDOG_DEV" >&2
+    exit 1
+}
+
+CHECKER_PID=""
+DISARMED=0
+
+disarm()
+{
+    [ "$DISARMED" = "1" ] && return 0
+    DISARMED=1
+
+    printf 'V' >&9 2>/dev/null || true
+    exec 9>&- 2>/dev/null || true
+
+    [ -n "$CHECKER_PID" ] && kill "$CHECKER_PID" 2>/dev/null
+
+    rm -f "$STATE_FILE" "$VERDICT_FILE" 2>/dev/null
+}
+
+on_exit()
+{
+    local code=$?
+    disarm
+    plog INFO "exiting (status ${code}) - watchdog disarmed, the board will NOT reset"
+    exit "$code"
+}
+
+trap on_exit EXIT
+trap 'exit 0' TERM INT
+
+gate_dns()
+{
+    local out
+    out=$(timeout 5 drill "@127.0.0.1" "$DNS_PROBE_NAME" A 2>/dev/null) || return 1
+    [ -n "$out" ] || return 1
+
+    case "$out" in
+        *"rcode: NOERROR"*) ;;
+        *) return 1 ;;
+    esac
+
+    printf '%s\n' "$out" | grep -qE '^;; flags:.*ANSWER: [1-9]'
+}
+
+gate_filesystem()
+{
+    if awk '$2 == "/" { split($4, opts, ","); for (i in opts) if (opts[i] == "ro") exit 0; exit 1 }' /proc/mounts; then
+        return 1
+    fi
+
+    local probe="/run/.watchdog-write-test.$$"
+    timeout 5 touch "$probe" 2>/dev/null && rm -f "$probe" 2>/dev/null
+}
+
+gate_ssh()
+{
+    timeout 5 ss -tln "sport = :${SSH_PORT}" 2>/dev/null | grep -q LISTEN
+}
+
+gate_memory()
+{
+    local available
+    available=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)
+    [ -n "$available" ] && [ "$available" -gt "$MIN_MEM_AVAILABLE_KB" ]
+}
+
+gate_load()
+{
+    local load
+    load=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null | cut -d. -f1)
+    [ -n "$load" ] && [ "$load" -lt "$MAX_LOADAVG" ]
+}
+
+gate_fork()
+{
+    timeout 5 /bin/true 2>/dev/null
+}
+
+remediate()
+{
+    local gate="$1"
+    local attempts="$2"
+
+    if [ "$ARM_REBOOT" != "1" ]; then
+        clog INFO "gate '${gate}': WOULD remediate here, but ARM_REBOOT=0 - taking no action" notice
+        return 1
+    fi
+
+    if [ "$attempts" -ge "$REMEDIATE_LIMIT" ]; then
+        clog WARN "gate '${gate}': already remediated ${attempts}x, not trying again" warning
+        return 1
+    fi
+
+    case "$gate" in
+        dns)
+            clog WARN "gate 'dns': restarting the adguard container" warning
+            timeout 60 runuser -u "$SERVICE_USER" -- podman restart adguard >/dev/null 2>&1
+
+            local waited=0
+            while [ "$waited" -lt 45 ]; do
+                sleep 5
+                waited=$(( waited + 5 ))
+                gate_dns && return 0
+            done
+
+            return 1
+            ;;
+        ssh)
+            clog WARN "gate 'ssh': restarting sshd" warning
+            timeout 30 sv restart sshd >/dev/null 2>&1
+            sleep 5
+            gate_ssh
+            ;;
+        memory)
+            clog WARN "gate 'memory': dropping clean page cache" warning
+            sync
+            echo 1 > /proc/sys/vm/drop_caches 2>/dev/null
+            sleep 5
+            gate_memory
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+checker_main()
+{
+    declare -A failures=()
+    declare -A remediations=()
+    declare -A ever_passed=()
+    declare -A gave_up=()
+
+    for gate in $GATES; do
+        failures[$gate]=0
+        remediations[$gate]=0
+        ever_passed[$gate]=0
+        gave_up[$gate]=0
+    done
+
+    printf 'ok\n' > "$VERDICT_FILE"
+
+    local up_now
+    up_now=$(uptime_seconds)
+
+    if [ "$up_now" -lt "$STARTUP_DELAY_SECONDS" ]; then
+        local hold=$(( STARTUP_DELAY_SECONDS - up_now ))
+        clog INFO "boot detected (up ${up_now}s) - holding monitoring for ${hold}s before the first check"
+        sleep "$hold"
+    fi
+
+    clog INFO "checker started; gates cannot trip until ${GRACE_SECONDS}s uptime, and never before a gate has passed once"
+
+    while :; do
+        sleep "$CHECK_INTERVAL"
+
+        local up
+        up=$(uptime_seconds)
+
+        local in_grace=0
+        [ "$up" -lt "$GRACE_SECONDS" ] && in_grace=1
+
+        local failing=""
+
+        for gate in $GATES; do
+            if "gate_${gate}"; then
+                if [ "${failures[$gate]}" -gt 0 ]; then
+                    clog INFO "gate '${gate}' recovered after ${failures[$gate]} failures"
+                fi
+
+                failures[$gate]=0
+                remediations[$gate]=0
+                gave_up[$gate]=0
+                ever_passed[$gate]=1
+                continue
+            fi
+
+            if [ "${gave_up[$gate]}" = "1" ]; then
+                continue
+            fi
+
+            if [ "${ever_passed[$gate]}" != "1" ]; then
+                clog INFO "gate '${gate}' has not come up yet - not counting it as a failure"
+                continue
+            fi
+
+            if [ "$in_grace" = "1" ]; then
+                clog INFO "gate '${gate}' failed, but the box has only been up ${up}s - ignoring during grace"
+                continue
+            fi
+
+            failures[$gate]=$(( failures[$gate] + 1 ))
+            failing="$gate"
+
+            clog WARN "gate '${gate}' failed (${failures[$gate]}/${FAIL_THRESHOLD})" warning
+
+            if [ "${failures[$gate]}" -eq $(( (FAIL_THRESHOLD + 1) / 2 )) ]; then
+                if remediate "$gate" "${remediations[$gate]}"; then
+                    clog INFO "gate '${gate}': remediation succeeded"
+                    failures[$gate]=0
+                    failing=""
+                fi
+                remediations[$gate]=$(( remediations[$gate] + 1 ))
+            fi
+
+            if [ "${failures[$gate]}" -ge "$FAIL_THRESHOLD" ]; then
+                gave_up[$gate]=1
+
+                if [ "$ARM_REBOOT" != "1" ]; then
+                    clog ERROR "WOULD REBOOT: gate '${gate}' failed ${failures[$gate]} consecutive checks. ARM_REBOOT=0, so nothing is being done. Set ARM_REBOOT=1 in ${CONFIG_FILE} to make this real." err
+
+                    failures[$gate]=0
+                    gave_up[$gate]=0
+                else
+                    clog ERROR "gate '${gate}' failed ${failures[$gate]} consecutive checks - requesting graceful reboot" err
+                    printf 'reboot:%s\n' "$gate" > "$VERDICT_FILE"
+                fi
+            fi
+        done
+
+        publish_state "$failing" "$up" failures
+    done
+}
+
+publish_state()
+{
+    local failing="$1"
+    local up="$2"
+    local -n counts="$3"
+    local tmp="${STATE_FILE}.tmp"
+
+    {
+        printf '{\n'
+        printf '  "lastPet": "%s",\n' "$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')"
+        printf '  "armed": %s,\n' "$([ "$ARM_REBOOT" = "1" ] && echo true || echo false)"
+        printf '  "petting": true,\n'
+        printf '  "petIntervalSeconds": %s,\n' "$PET_INTERVAL"
+        printf '  "failThreshold": %s,\n' "$FAIL_THRESHOLD"
+        printf '  "uptimeSeconds": %s,\n' "$up"
+        printf '  "inGrace": %s,\n' "$([ "$up" -lt "$GRACE_SECONDS" ] && echo true || echo false)"
+        printf '  "graceSeconds": %s,\n' "$GRACE_SECONDS"
+        printf '  "gates": {\n'
+
+        local first=1
+        for gate in $GATES; do
+            [ "$first" = 0 ] && printf ',\n'
+            first=0
+            printf '    "%s": %s' "$gate" "${counts[$gate]:-0}"
+        done
+
+        printf '\n  },\n'
+        printf '  "failing": "%s"\n' "$failing"
+        printf '}\n'
+    } > "$tmp" 2>/dev/null && mv "$tmp" "$STATE_FILE" 2>/dev/null
+
+    chmod 0644 "$STATE_FILE" 2>/dev/null || true
+}
+
+TICK_FIFO="${TICK_FIFO:-/run/relaxy-watchdog.tick}"
+TICK_MODE="fifo"
+
+rm -f "$TICK_FIFO" 2>/dev/null
+mkfifo -m 0600 "$TICK_FIFO" 2>/dev/null || TICK_MODE="sleep"
+
+if [ "$TICK_MODE" = "fifo" ]; then
+    exec 8<>"$TICK_FIFO" 2>/dev/null || TICK_MODE="sleep"
+fi
+
+pet_delay()
+{
+    if [ "$TICK_MODE" = "fifo" ]; then
+        local rc=0
+        read -r -t "$PET_INTERVAL" -u 8 _ 2>/dev/null || rc=$?
+
+        if [ "$rc" -gt 128 ]; then
+            return 0
+        fi
+
+        TICK_MODE="sleep"
+        plog WARN "tick fifo unusable (read rc=${rc}) - falling back to sleep for the pet delay"
+    fi
+
+    sleep "$PET_INTERVAL"
+}
+
+checker_main &
+CHECKER_PID=$!
+
+plog INFO "watchdog opened; layer 2 is $([ "$ARM_REBOOT" = "1" ] && echo ARMED || echo observing); petting every ${PET_INTERVAL}s; checker pid ${CHECKER_PID}"
+
+reboot_requested_at=0
+
+while :; do
+    printf '.' >&9 2>/dev/null
+
+    verdict="ok"
+    if [ -r "$VERDICT_FILE" ]; then
+        read -r verdict < "$VERDICT_FILE" 2>/dev/null || verdict="ok"
+    fi
+
+    case "$verdict" in
+        reboot:*)
+            if [ "$reboot_requested_at" = "0" ]; then
+                gate="${verdict#reboot:}"
+                plog ERROR "gate '${gate}' has requested a reboot - syncing and rebooting GRACEFULLY"
+
+                sync
+                ( setsid reboot >/dev/null 2>&1 & ) 2>/dev/null
+
+                read -r reboot_requested_at _ < /proc/uptime
+                reboot_requested_at="${reboot_requested_at%.*}"
+            else
+                read -r now _ < /proc/uptime
+                now="${now%.*}"
+
+                if [ $(( now - reboot_requested_at )) -ge "$REBOOT_GRACE_SECONDS" ]; then
+                    plog ERROR "graceful reboot did not complete within ${REBOOT_GRACE_SECONDS}s - releasing the watchdog for a hardware reset"
+
+                    exec 9>&-
+                    DISARMED=1
+
+                    while :; do pet_delay; done
+                fi
+            fi
+            ;;
+    esac
+
+    if [ -n "$CHECKER_PID" ] && ! kill -0 "$CHECKER_PID" 2>/dev/null; then
+        plog WARN "checker process died - layer 2 is offline; continuing to pet (the box stays up)"
+        CHECKER_PID=""
+    fi
+
+    pet_delay
+done

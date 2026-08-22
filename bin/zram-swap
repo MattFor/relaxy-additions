@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+CONFIG_FILE="${CONFIG_FILE:-/etc/relaxy-watchdog.conf}"
+
+ZRAM_PERCENT=50
+ZRAM_ALGO=lz4
+ZRAM_DEVICE=/dev/zram0
+
+ZRAM_SWAPPINESS=150
+
+ZRAM_PAGE_CLUSTER=0
+
+[ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+
+start()
+{
+    if [ "$(id -u)" -ne 0 ]; then
+        log "ERROR: must run as root"
+        exit 1
+    fi
+
+    if swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$ZRAM_DEVICE"; then
+        log "zram swap already active on $ZRAM_DEVICE - nothing to do"
+        return 0
+    fi
+
+    modprobe zram num_devices=1 2>/dev/null || {
+        log "ERROR: could not load the zram module"
+        exit 1
+    }
+
+    if [ -e /sys/block/zram0/disksize ] && [ "$(cat /sys/block/zram0/disksize)" != "0" ]; then
+        swapoff "$ZRAM_DEVICE" 2>/dev/null || true
+        echo 1 > /sys/block/zram0/reset 2>/dev/null || true
+        sleep 1
+    fi
+
+    local mem_total_kb size_bytes
+    mem_total_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+    size_bytes=$(( mem_total_kb * 1024 * ZRAM_PERCENT / 100 ))
+
+    if grep -qw "$ZRAM_ALGO" /sys/block/zram0/comp_algorithm 2>/dev/null; then
+        echo "$ZRAM_ALGO" > /sys/block/zram0/comp_algorithm
+    else
+        log "WARNING: ${ZRAM_ALGO} unavailable, using the kernel default"
+    fi
+
+    echo "$size_bytes" > /sys/block/zram0/disksize
+
+    mkswap "$ZRAM_DEVICE" >/dev/null 2>&1
+
+    swapon --priority 100 "$ZRAM_DEVICE"
+
+    sysctl -qw vm.swappiness="$ZRAM_SWAPPINESS"
+    sysctl -qw vm.page-cluster="$ZRAM_PAGE_CLUSTER"
+
+    log "zram swap active: $(( size_bytes / 1048576 )) MB via ${ZRAM_ALGO}, swappiness=${ZRAM_SWAPPINESS}"
+}
+
+stop()
+{
+    if swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$ZRAM_DEVICE"; then
+        log "disabling zram swap (this may take a moment while pages are written back)"
+        swapoff "$ZRAM_DEVICE" || true
+    fi
+
+    [ -e /sys/block/zram0/reset ] && echo 1 > /sys/block/zram0/reset 2>/dev/null || true
+
+    log "zram swap stopped"
+}
+
+status()
+{
+    if ! swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$ZRAM_DEVICE"; then
+        echo "zram swap is NOT active"
+        return 1
+    fi
+
+    swapon --show
+    echo
+    if [ -r /sys/block/zram0/mm_stat ]; then
+        awk '{
+            printf "uncompressed stored : %.1f MB\n", $1/1048576
+            printf "compressed size     : %.1f MB\n", $2/1048576
+            printf "total RAM used      : %.1f MB\n", $3/1048576
+            if ($2 > 0) printf "compression ratio   : %.2fx\n", $1/$2
+        }' /sys/block/zram0/mm_stat
+    fi
+}
+
+case "${1:-start}" in
+    start)  start ;;
+    stop)   stop ;;
+    status) status ;;
+    *)      echo "usage: $0 {start|stop|status}" >&2; exit 2 ;;
+esac

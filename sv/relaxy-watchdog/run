@@ -1,0 +1,6 @@
+#!/bin/sh
+exec 2>&1
+
+echo -1000 > /proc/self/oom_score_adj 2>/dev/null || true
+
+exec nice -n -20 /home/mattfor/relaxy/additions/bin/relaxy-watchdog

@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex, nofollow">
+    <title>RelaxyPI · Home Admin</title>
+    <style>
+
+        :root {
+            color-scheme: dark;
+
+            --surface-0: #0e1013;
+            --surface-1: #14161a;
+            --surface-2: #1a1c21;
+            --border: #2a2d33;
+            --border-soft: rgba(255, 255, 255, 0.06);
+
+            --text-primary: #e8eaee;
+            --text-secondary: #a8adb7;
+            --text-muted: #6f747e;
+
+            --good: #0ca30c;
+            --warning: #fab219;
+            --critical: #d03b3b;
+
+            --seq: #3987e5;
+
+            --radius: 12px;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            padding: 32px 24px 56px;
+            background: var(--surface-0);
+            color: var(--text-primary);
+            font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+            font-size: 15px;
+            line-height: 1.5;
+        }
+
+        .wrap {
+            max-width: 940px;
+            margin: 0 auto;
+        }
+
+        .head {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: baseline;
+            gap: 10px 16px;
+            margin-bottom: 4px;
+        }
+
+        h1 {
+            font-size: 1.6rem;
+            margin: 0;
+            font-weight: 650;
+            letter-spacing: -0.015em;
+        }
+
+        .sub {
+            color: var(--text-secondary);
+            font-size: 0.88rem;
+            margin: 0 0 26px;
+        }
+
+        .overall {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.78rem;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            padding: 4px 12px;
+            border-radius: 999px;
+            background: var(--surface-2);
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+        }
+
+        .overall .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+
+        .overall.is-ok {
+            color: var(--good);
+            background: color-mix(in srgb, var(--good) 13%, transparent);
+            border-color: color-mix(in srgb, var(--good) 38%, transparent);
+        }
+
+        .overall.is-bad {
+            color: var(--critical);
+            background: color-mix(in srgb, var(--critical) 13%, transparent);
+            border-color: color-mix(in srgb, var(--critical) 40%, transparent);
+        }
+
+        .attention {
+            border-radius: var(--radius);
+            padding: 14px 16px;
+            margin-bottom: 24px;
+            font-size: 0.88rem;
+            background: color-mix(in srgb, var(--critical) 10%, transparent);
+            border: 1px solid color-mix(in srgb, var(--critical) 36%, transparent);
+            color: #f0a3a3;
+        }
+
+        .attention strong {
+            color: #ffbdbd;
+        }
+
+        .attention ul {
+            margin: 8px 0 0;
+            padding-left: 20px;
+        }
+
+        .attention li {
+            margin: 2px 0;
+        }
+
+        .vitals {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+            gap: 10px;
+            margin-bottom: 28px;
+        }
+
+        .vital {
+            background: var(--surface-1);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 13px 15px;
+        }
+
+        .vital .k {
+            display: block;
+            font-size: 0.68rem;
+            text-transform: uppercase;
+            letter-spacing: 0.07em;
+            color: var(--text-muted);
+            font-weight: 700;
+            margin-bottom: 4px;
+        }
+
+        .vital .v {
+            display: block;
+            font-size: 1.3rem;
+            font-weight: 650;
+            letter-spacing: -0.015em;
+            font-variant-numeric: tabular-nums;
+        }
+
+        h2 {
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-muted);
+            font-weight: 700;
+            margin: 0 0 12px;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            gap: 12px;
+            margin-bottom: 30px;
+        }
+
+        a.card {
+            display: block;
+            background: var(--surface-1);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 16px 18px;
+            text-decoration: none;
+            color: inherit;
+            transition: border-color 0.15s ease, transform 0.15s ease;
+        }
+
+        a.card:hover {
+            border-color: var(--seq);
+            transform: translateY(-1px);
+        }
+
+        a.card .title {
+            font-size: 1rem;
+            font-weight: 620;
+            margin-bottom: 3px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+        }
+
+        a.card .desc {
+            font-size: 0.82rem;
+            color: var(--text-secondary);
+        }
+
+        .pill {
+            font-size: 0.62rem;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            padding: 2px 8px;
+            border-radius: 999px;
+            white-space: nowrap;
+        }
+
+        .pill.is-online {
+            color: var(--good);
+            background: color-mix(in srgb, var(--good) 14%, transparent);
+            border: 1px solid color-mix(in srgb, var(--good) 38%, transparent);
+        }
+
+        .pill.is-offline {
+            color: var(--critical);
+            background: color-mix(in srgb, var(--critical) 14%, transparent);
+            border: 1px solid color-mix(in srgb, var(--critical) 40%, transparent);
+        }
+
+        .foot {
+            color: var(--text-muted);
+            font-size: 0.76rem;
+            font-variant-numeric: tabular-nums;
+        }
+    </style>
+</head>
+<body>
+<div class="wrap">
+
+    <div class="head">
+        <h1>RelaxyPI</h1>
+        <span class="overall" id="overall"><span class="dot" aria-hidden="true"></span><span id="overall-text">Checking</span></span>
+    </div>
+    <p class="sub" id="sub">Home admin &middot; reading live status from the Pi…</p>
+
+    <div id="attention"></div>
+
+    <div class="vitals" id="vitals"></div>
+
+    <h2>Monitoring</h2>
+    <div class="grid">
+        <a class="card" href="/pi.html">
+            <div class="title">Raspberry Pi stats <span id="pill-pi"></span></div>
+            <div class="desc">Every service, per-core CPU, memory, temperature, watchdog gates and top processes.</div>
+        </a> <a class="card" href="/stats.html">
+        <div class="title">Web traffic <span class="pill is-online" id="pill-goaccess"></span></div>
+        <div class="desc">GoAccess, live from the Caddy access logs across all sites.</div>
+    </a>
+    </div>
+
+    <h2>Services</h2>
+    <div class="grid">
+        <a class="card" href="https://nsdchfasaxo.relaxy.xyz">
+            <div class="title">AdGuard Home <span id="pill-adguard"></span></div>
+            <div class="desc">DNS filtering for the whole house. This is the LAN's only resolver.</div>
+        </a> <a class="card" href="https://dashboard.relaxy.xyz">
+        <div class="title">Relaxy! Dashboard <span id="pill-dashboard"></span></div>
+        <div class="desc">Bot administration, economy, moderation and settings.</div>
+    </a> <a class="card" href="https://matrix.relaxy.xyz">
+        <div class="title">Matrix <span id="pill-matrix"></span></div>
+        <div class="desc">Continuwuity homeserver for matrix.relaxy.xyz.</div>
+    </a> <a class="card" href="https://relaxy.xyz">
+        <div class="title">Website <span id="pill-website"></span></div>
+        <div class="desc">The public site, served by Caddy from this Pi.</div>
+    </a>
+    </div>
+
+    <p class="foot" id="foot">&nbsp;</p>
+
+</div>
+
+<script>
+    'use strict';
+
+    const REFRESH_MS = 20000;
+    const VITALS_REFRESH_MS = 5000;
+    const $ = (id) => document.getElementById(id);
+
+    const fmtUptime = (seconds) =>
+    {
+        if (typeof seconds !== 'number')
+        { return '-'; }
+
+        const d = Math.floor(seconds / 86400);
+        const h = Math.floor((seconds % 86400) / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+
+        if (d > 0)
+        { return d + 'd ' + h + 'h'; }
+        return h > 0
+            ? h + 'h ' + m + 'm'
+            : m + 'm';
+    };
+
+    const num = (value, digits = 0) => (typeof value === 'number'
+        ? value.toFixed(digits)
+        : '-');
+
+    const pill = (id, service) =>
+    {
+        const element = $(id);
+
+        if (!element)
+        { return; }
+
+        if (!service || service.online === null)
+        {
+            element.className = 'pill';
+            element.textContent = '';
+            return;
+        }
+
+        element.className = 'pill ' + (service.online
+            ? 'is-online'
+            : 'is-offline');
+        element.textContent = service.online
+            ? 'Online'
+            : 'Offline';
+    };
+
+    const render = (data) =>
+    {
+        const services = data.services || [];
+        const system = data.system || {};
+        const summary = data.summary || {};
+        const byKey = Object.fromEntries(services.map((service) => [
+            service.key,
+            service
+        ]));
+
+        const allUp = summary.offline === 0;
+
+        $('overall').className = 'overall ' + (allUp
+            ? 'is-ok'
+            : 'is-bad');
+        $('overall-text').textContent = allUp
+            ? 'All systems go'
+            : summary.offline + ' down';
+
+        $('sub').textContent = 'Home admin · ' + (system.model || '') + ' · ' + (system.os || '');
+
+        const down = services.filter((service) => service.online === false);
+
+        $('attention').innerHTML = down.length
+            ? '<div class="attention"><strong>Needs attention</strong><ul>' + down.map((service) => '<li>' + service.name + (service.detail
+            ? ' - <span style="opacity:0.8">' + service.detail + '</span>'
+            : '') + '</li>').join('') + '</ul></div>'
+            : '';
+
+        const swap = system.swap && system.swap.totalGb
+            ? num(system.swap.percent) + '%'
+            : 'none';
+
+        lastSummary = {
+            online:     summary.online,
+            total:      summary.total,
+            uptimeText: fmtUptime(system.uptimeSeconds),
+            swapText:   swap
+        };
+
+        $('vitals').innerHTML = [
+            [
+                'Services',
+                summary.online + '/' + summary.total
+            ],
+            [
+                'Uptime',
+                fmtUptime(system.uptimeSeconds)
+            ],
+            [
+                'CPU',
+                num(system.cpu && system.cpu.busyPercent) + '%'
+            ],
+            [
+                'Memory',
+                num(system.memory && system.memory.percent) + '%'
+            ],
+            [
+                'Swap',
+                swap
+            ],
+            [
+                'Temp',
+                num(system.temperatureC, 1) + '°C'
+            ]
+        ].map(function (row)
+        {
+            return '<div class="vital"><span class="k">' + row[0] + '</span><span class="v">' + row[1] + '</span></div>';
+        }).join('');
+
+        pill('pill-adguard', byKey.adguard);
+        pill('pill-dashboard', byKey.dashboard);
+        pill('pill-matrix', byKey.matrix);
+        pill('pill-website', byKey.website);
+        pill('pill-pi', { online: true });
+
+        const goaccess = $('pill-goaccess');
+        if (goaccess && byKey.goaccess)
+        {
+            goaccess.className = 'pill ' + (byKey.goaccess.online
+                ? 'is-online'
+                : 'is-offline');
+            goaccess.textContent = byKey.goaccess.online
+                ? 'Live'
+                : 'Offline';
+        }
+
+        const age = Math.round((Date.now() - Date.parse(data.generatedAt)) / 1000);
+        $('foot').textContent = 'Updated ' + age + 's ago · ' + (system.host || '');
+    };
+
+    const load = () =>
+    {
+        fetch('/pi-health.json', { cache: 'no-store' })
+            .then(function (response)
+            {
+                return response.ok
+                    ? response.json()
+                    : Promise.reject(new Error('HTTP ' + response.status));
+            })
+            .then(render)
+            .catch(function (error)
+            {
+                $('overall').className = 'overall is-bad';
+                $('overall-text').textContent = 'Feed down';
+                $('foot').textContent = 'Could not read the health feed (' + error.message + '). Is relaxy-health running?';
+            });
+    };
+
+    let lastSummary = null;
+
+    const loadVitals = () =>
+    {
+        fetch('/pi-vitals.json', { cache: 'no-store' })
+            .then(function (response)
+            {
+                return response.ok
+                    ? response.json()
+                    : Promise.reject();
+            })
+            .then(function (data)
+            {
+                var now = data.current || {};
+                var vitals = $('vitals');
+
+                if (!vitals || !lastSummary)
+                { return; }
+
+                var swap = lastSummary.swapText;
+
+                vitals.innerHTML = [
+                    [
+                        'Services',
+                        lastSummary.online + '/' + lastSummary.total
+                    ],
+                    [
+                        'Uptime',
+                        lastSummary.uptimeText
+                    ],
+                    [
+                        'CPU',
+                        num(now.cpu) + '%'
+                    ],
+                    [
+                        'Memory',
+                        num(now.mem) + '%'
+                    ],
+                    [
+                        'Swap',
+                        swap
+                    ],
+                    [
+                        'Temp',
+                        num(now.temp, 1) + '°C'
+                    ]
+                ].map(function (row)
+                {
+                    return '<div class="vital"><span class="k">' + row[0] + '</span><span class="v">' + row[1] + '</span></div>';
+                }).join('');
+            })
+            .catch(function () { });
+    };
+
+    load();
+    setInterval(load, REFRESH_MS);
+
+    loadVitals();
+    setInterval(loadVitals, VITALS_REFRESH_MS);
+</script>
+</body>
+</html>

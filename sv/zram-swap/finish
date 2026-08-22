@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /home/mattfor/relaxy/additions/bin/zram-swap stop

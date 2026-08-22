@@ -1,0 +1,1430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex, nofollow">
+    <title>Raspberry Pi stats · RelaxyPI</title>
+    <style>
+
+        :root {
+            color-scheme: dark;
+
+            --surface-0: #0e1013;
+            --surface-1: #14161a;
+            --surface-2: #1a1c21;
+            --border: #2a2d33;
+            --border-soft: rgba(255, 255, 255, 0.06);
+
+            --text-primary: #e8eaee;
+            --text-secondary: #a8adb7;
+            --text-muted: #6f747e;
+
+            --good: #0ca30c;
+            --warning: #fab219;
+            --critical: #d03b3b;
+            --unknown: #6f747e;
+
+            --seq: #3987e5;
+
+            --radius: 12px;
+            --radius-sm: 8px;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            padding: 24px;
+            background: var(--surface-0);
+            color: var(--text-primary);
+            font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+            font-size: 15px;
+            line-height: 1.5;
+        }
+
+        .wrap {
+            max-width: 1180px;
+            margin: 0 auto;
+        }
+
+        .page-head {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: baseline;
+            gap: 12px 20px;
+            margin-bottom: 8px;
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            margin: 0;
+            font-weight: 650;
+            letter-spacing: -0.01em;
+        }
+
+        .page-sub {
+            color: var(--text-secondary);
+            margin: 0 0 24px;
+            font-size: 0.9rem;
+        }
+
+        .page-sub code {
+            color: var(--text-primary);
+        }
+
+        .back {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 0.85rem;
+            border: 1px solid var(--border);
+            padding: 4px 12px;
+            border-radius: 999px;
+        }
+
+        .back:hover {
+            border-color: var(--seq);
+            color: var(--text-primary);
+        }
+
+        section {
+            margin-bottom: 28px;
+        }
+
+        h2 {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-muted);
+            font-weight: 700;
+            margin: 0 0 12px;
+        }
+
+        .card {
+            background: var(--surface-1);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 18px;
+        }
+
+        .kpi-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+            gap: 12px;
+        }
+
+        .kpi {
+            background: var(--surface-1);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 16px 18px;
+        }
+
+        .kpi .label {
+            display: block;
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.07em;
+            color: var(--text-muted);
+            font-weight: 700;
+            margin-bottom: 6px;
+        }
+
+        .kpi .value {
+            display: block;
+            font-size: 1.75rem;
+            font-weight: 650;
+            letter-spacing: -0.02em;
+            line-height: 1.15;
+        }
+
+        .kpi .sub {
+            display: block;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-top: 3px;
+        }
+
+        .kpi.hero .value {
+            font-size: 2.6rem;
+        }
+
+        .meter-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 12px;
+        }
+
+        .meter + .meter {
+            margin-top: 14px;
+        }
+
+        .meter-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 12px;
+            margin-bottom: 6px;
+        }
+
+        .meter-name {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+
+        .meter-value {
+            font-size: 0.85rem;
+            font-weight: 650;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .track {
+            height: 8px;
+            background: var(--surface-2);
+            border-radius: 999px;
+            overflow: hidden;
+        }
+
+        .fill {
+            height: 100%;
+
+            border-radius: 0 4px 4px 0;
+            background: var(--seq);
+            transition: width 0.4s ease, background-color 0.4s ease;
+            min-width: 2px;
+        }
+
+        .fill.is-warning {
+            background: var(--warning);
+        }
+
+        .fill.is-critical {
+            background: var(--critical);
+        }
+
+        .cores {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 10px;
+            margin-top: 14px;
+        }
+
+        .core-label {
+            font-size: 0.72rem;
+            color: var(--text-muted);
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 4px;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            padding: 3px 10px;
+            border-radius: 999px;
+            white-space: nowrap;
+        }
+
+        .badge .glyph {
+            font-size: 0.85em;
+            line-height: 1;
+        }
+
+        .badge.is-online {
+            color: var(--good);
+            background: color-mix(in srgb, var(--good) 14%, transparent);
+            border: 1px solid color-mix(in srgb, var(--good) 40%, transparent);
+        }
+
+        .badge.is-offline {
+            color: var(--critical);
+            background: color-mix(in srgb, var(--critical) 14%, transparent);
+            border: 1px solid color-mix(in srgb, var(--critical) 42%, transparent);
+        }
+
+        .badge.is-degraded {
+            color: var(--warning);
+            background: color-mix(in srgb, var(--warning) 14%, transparent);
+            border: 1px solid color-mix(in srgb, var(--warning) 42%, transparent);
+        }
+
+        .badge.is-unknown {
+            color: var(--text-secondary);
+            background: var(--surface-2);
+            border: 1px solid var(--border);
+        }
+
+        .cat + .cat {
+            margin-top: 20px;
+        }
+
+        .cat-name {
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.07em;
+            color: var(--text-muted);
+            font-weight: 700;
+            margin: 0 0 8px;
+        }
+
+        .svc-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+            gap: 10px;
+        }
+
+        .svc {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            background: var(--surface-1);
+            border: 1px solid var(--border);
+            border-left: 3px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 11px 14px;
+        }
+
+        .svc.is-online {
+            border-left-color: var(--good);
+        }
+
+        .svc.is-offline {
+            border-left-color: var(--critical);
+        }
+
+        .svc.is-unknown {
+            border-left-color: var(--unknown);
+        }
+
+        .svc-main {
+            min-width: 0;
+        }
+
+        .svc-name {
+            font-size: 0.9rem;
+            font-weight: 550;
+        }
+
+        .svc-name .crit {
+            color: var(--warning);
+            font-size: 0.75em;
+            margin-left: 5px;
+        }
+
+        .svc-detail {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            font-variant-numeric: tabular-nums;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .table-scroll {
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85rem;
+        }
+
+        th, td {
+            text-align: left;
+            padding: 7px 10px;
+            border-bottom: 1px solid var(--border-soft);
+            white-space: nowrap;
+        }
+
+        th {
+            color: var(--text-muted);
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            font-weight: 700;
+        }
+
+        td.num, th.num {
+            text-align: right;
+            font-variant-numeric: tabular-nums;
+        }
+
+        tbody tr:last-child td {
+            border-bottom: none;
+        }
+
+        .kv {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+            gap: 10px 22px;
+        }
+
+        .kv div {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            border-bottom: 1px solid var(--border-soft);
+            padding-bottom: 5px;
+        }
+
+        .kv dt, .kv .k {
+            color: var(--text-muted);
+            font-size: 0.8rem;
+        }
+
+        .kv .v {
+            font-size: 0.8rem;
+            font-variant-numeric: tabular-nums;
+            text-align: right;
+        }
+
+        .notice {
+            border-radius: var(--radius-sm);
+            padding: 12px 14px;
+            font-size: 0.85rem;
+            margin-bottom: 12px;
+        }
+
+        .notice.is-warning {
+            background: color-mix(in srgb, var(--warning) 10%, transparent);
+            border: 1px solid color-mix(in srgb, var(--warning) 35%, transparent);
+            color: #f5d089;
+        }
+
+        .notice.is-critical {
+            background: color-mix(in srgb, var(--critical) 10%, transparent);
+            border: 1px solid color-mix(in srgb, var(--critical) 38%, transparent);
+            color: #f0a3a3;
+        }
+
+        .stamp {
+            color: var(--text-muted);
+            font-size: 0.78rem;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .chart-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+        }
+
+        .chart-card.is-wide {
+            grid-column: 1 / -1;
+        }
+
+        @media (max-width: 1080px) {
+            .chart-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        @media (max-width: 720px) {
+            .chart-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .chart-card {
+            background: var(--surface-1);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 14px 16px 10px;
+            position: relative;
+        }
+
+        .chart-head {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 10px;
+            margin-bottom: 2px;
+        }
+
+        .chart-title {
+            font-size: 0.8rem;
+            font-weight: 620;
+            color: var(--text-secondary);
+        }
+
+        .chart-now {
+            font-size: 1.05rem;
+            font-weight: 650;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .chart-legend {
+            display: flex;
+            gap: 14px;
+            margin-bottom: 6px;
+        }
+
+        .chart-legend .item {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 0.72rem;
+            color: var(--text-secondary);
+        }
+
+        .chart-legend .swatch {
+            width: 10px;
+            height: 2px;
+            border-radius: 1px;
+        }
+
+        .chart-svg {
+            width: 100%;
+            height: 130px;
+            display: block;
+            overflow: visible;
+        }
+
+        .chart-svg .grid {
+            stroke: #23262c;
+            stroke-width: 1;
+        }
+
+        .chart-svg .axis {
+            fill: var(--text-muted);
+            font-size: 9px;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .chart-svg .line {
+            fill: none;
+            stroke-width: 2;
+            stroke-linejoin: round;
+            stroke-linecap: round;
+        }
+
+        .chart-svg .crosshair {
+            stroke: var(--text-muted);
+            stroke-width: 1;
+            stroke-dasharray: 2 2;
+        }
+
+        .chart-tip {
+            position: absolute;
+            pointer-events: none;
+            background: var(--surface-2);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 5px 8px;
+            font-size: 0.72rem;
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
+            opacity: 0;
+            transition: opacity 0.1s;
+            z-index: 5;
+        }
+
+        .chart-tip .t {
+            color: var(--text-muted);
+            display: block;
+            font-size: 0.66rem;
+        }
+
+        .stat-table td.metric {
+            color: var(--text-secondary);
+        }
+
+        .stat-table td.num, .stat-table th.num {
+            font-variant-numeric: tabular-nums;
+        }
+
+        .stat-bar {
+            display: inline-block;
+            height: 4px;
+            border-radius: 2px;
+            background: var(--seq);
+            vertical-align: middle;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .fill {
+                transition: none;
+            }
+        }
+    </style>
+</head>
+<body>
+<div class="wrap">
+
+    <div class="page-head">
+        <h1>Raspberry Pi stats</h1>
+        <a class="back" href="/">&larr; back</a> <span class="stamp" id="stamp">loading…</span>
+    </div>
+    <p class="page-sub" id="ident">Reading <code>/pi-health.json</code>…</p>
+
+    <div id="alerts"></div>
+
+    <section>
+        <h2>At a glance</h2>
+        <div class="kpi-row" id="kpis"></div>
+    </section>
+
+    <section>
+        <h2>Resources</h2>
+        <div class="meter-grid">
+            <div class="card">
+                <div id="cpu-meters"></div>
+                <div class="cores" id="cores"></div>
+            </div>
+            <div class="card" id="mem-meters"></div>
+        </div>
+    </section>
+
+    <section>
+        <h2>Services</h2>
+        <div id="services"></div>
+    </section>
+
+    <section>
+        <h2>Watchdog</h2>
+        <div class="card" id="watchdog"></div>
+    </section>
+
+    <section>
+        <h2>Storage &amp; network</h2>
+        <div class="meter-grid">
+            <div class="card" id="disks"></div>
+            <div class="card" id="network"></div>
+        </div>
+    </section>
+
+    <section>
+        <h2>Top processes by CPU</h2>
+        <div class="card table-scroll" id="procs"></div>
+    </section>
+
+    <section>
+        <h2>Machine</h2>
+        <div class="card">
+            <div class="kv" id="machine"></div>
+        </div>
+    </section>
+
+    <section>
+        <h2>Graphs <span style="text-transform:none;letter-spacing:0;font-weight:400" id="graph-window"></span></h2>
+        <div class="chart-grid" id="charts"></div>
+    </section>
+
+    <section>
+        <h2>Statistics</h2>
+        <div class="card table-scroll">
+            <table class="stat-table">
+                <thead>
+                <tr>
+                    <th>Metric</th>
+                    <th class="num">Now</th>
+                    <th class="num">Min</th>
+                    <th class="num">Avg</th>
+                    <th class="num">Max</th>
+                    <th class="num">P95</th>
+                    <th>Range</th>
+                </tr>
+                </thead>
+                <tbody id="stats-body"></tbody>
+            </table>
+            <div class="stamp" style="margin-top:10px" id="stats-note"></div>
+        </div>
+    </section>
+
+</div>
+
+<script>
+    'use strict';
+
+    const ENDPOINT = '/pi-health.json';
+    const REFRESH_MS = 20000;
+    const VITALS_REFRESH_MS = 5000;
+
+    const $ = (id) => document.getElementById(id);
+    const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+        '&':  '&amp;',
+        '<':  '&lt;',
+        '>':  '&gt;',
+        '"':  '&quot;',
+        '\'': '&#39;'
+    }[ch]));
+
+    const fmtUptime = (seconds) =>
+    {
+        if (typeof seconds !== 'number')
+        { return '-'; }
+
+        const d = Math.floor(seconds / 86400);
+        const h = Math.floor((seconds % 86400) / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+
+        if (d > 0)
+        { return `${d}d ${h}h`; }
+        return h > 0
+            ? `${h}h ${m}m`
+            : `${m}m`;
+    };
+
+    const fmtAgo = (iso) =>
+    {
+        if (!iso)
+        { return '-'; }
+        const seconds = Math.floor((Date.now() - Date.parse(iso)) / 1000);
+        return Number.isFinite(seconds)
+            ? fmtUptime(Math.max(0, seconds))
+            : '-';
+    };
+
+    const num = (value, digits = 0) => (typeof value === 'number'
+        ? value.toFixed(digits)
+        : '-');
+
+    const severity = (percent, warn = 75, crit = 90) =>
+    {
+        if (typeof percent !== 'number')
+        { return ''; }
+        if (percent >= crit)
+        { return 'is-critical'; }
+        if (percent >= warn)
+        { return 'is-warning'; }
+        return '';
+    };
+
+    const meter = (name, valueText, percent, warn, crit) =>
+    {
+        const width = Math.max(0,
+            Math.min(100,
+                typeof percent === 'number'
+                    ? percent
+                    : 0));
+
+        return `<div class="meter">
+        <div class="meter-head">
+            <span class="meter-name">${esc(name)}</span>
+            <span class="meter-value">${esc(valueText)}</span>
+        </div>
+        <div class="track" role="meter" aria-label="${esc(name)}" aria-valuenow="${width.toFixed(0)}" aria-valuemin="0" aria-valuemax="100">
+            <div class="fill ${severity(percent, warn, crit)}" style="width:${width.toFixed(1)}%"></div>
+        </div>
+    </div>`;
+    };
+
+    const badge = (online) =>
+    {
+        if (online === true)
+        { return '<span class="badge is-online"><span class="glyph" aria-hidden="true">&#9679;</span>Online</span>'; }
+        if (online === false)
+        { return '<span class="badge is-offline"><span class="glyph" aria-hidden="true">&#10007;</span>Offline</span>'; }
+        return '<span class="badge is-unknown"><span class="glyph" aria-hidden="true">&#63;</span>Unknown</span>';
+    };
+
+    const stateClass = (online) => (online === true
+        ? 'is-online'
+        : online === false
+            ? 'is-offline'
+            : 'is-unknown');
+
+    const renderAlerts = (data) =>
+    {
+        const out = [];
+        const down = data.summary?.criticalOffline ?? [];
+
+        if (down.length)
+        {
+            const names = down
+                .map((key) => data.services.find((service) => service.key === key)?.name ?? key)
+                .map(esc)
+                .join(', ');
+
+            out.push(`<div class="notice is-critical"><strong>Critical service down:</strong> ${names}</div>`);
+        }
+
+        if (data.system && data.system.undervoltage && data.system.undervoltage.detected)
+        {
+            out.push(`<div class="notice is-critical"><strong>Undervoltage detected.</strong>
+            The 5V rail has dropped below spec. This is a leading cause of hard lockups and
+            SD card corruption on the Pi 4 &mdash; replace the power supply or the USB-C cable
+            before chasing anything else on this page.</div>`);
+        }
+
+        const watchdog = data.watchdog;
+
+        if (watchdog && watchdog.armed === false)
+        {
+            out.push(`<div class="notice is-warning"><strong>Watchdog layer 2 is in observe mode.</strong>
+            The hardware watchdog is petted normally, so a true kernel hang still reboots the Pi.
+            Health-gated reboots are only logged, not performed. Set <code>ARM_REBOOT=1</code> in
+            <code>/etc/relaxy-watchdog.conf</code> once the log looks clean.</div>`);
+        }
+
+        if (!watchdog)
+        {
+            out.push('<div class="notice is-critical"><strong>Watchdog is not reporting.</strong> Stuck detection is not currently running.</div>');
+        }
+
+        $('alerts').innerHTML = out.join('');
+    };
+
+    const renderKpis = (data) =>
+    {
+        const system = data.system ?? {};
+        const summary = data.summary ?? {};
+        const allUp = summary.offline === 0;
+
+        const cpu = system.cpu?.busyPercent;
+        const mem = system.memory?.percent;
+        const temp = system.temperatureC;
+
+        $('kpis').innerHTML = `
+        <div class="kpi hero">
+            <span class="label">Services online</span>
+            <span class="value" style="color:${allUp
+            ? 'var(--good)'
+            : 'var(--critical)'}">${summary.online ?? '-'}<span style="color:var(--text-muted);font-size:0.5em"> / ${summary.total ?? '-'}</span></span>
+            <span class="sub">${summary.offline
+            ? `${summary.offline} offline`
+            : 'all reporting healthy'}${summary.unknown
+            ? `, ${summary.unknown} unknown`
+            : ''}</span>
+        </div>
+        <div class="kpi">
+            <span class="label">Uptime</span>
+            <span class="value">${fmtUptime(system.uptimeSeconds)}</span>
+            <span class="sub">load ${(system.loadAverage ?? []).map((v) => num(v, 2)).join(' · ') || '-'}</span>
+        </div>
+        <div class="kpi">
+            <span class="label">CPU</span>
+            <span class="value">${num(cpu)}%</span>
+            <span class="sub">${system.cpu?.cores ?? '-'} cores @ ${system.cpu?.currentMhz ?? '-'} MHz</span>
+        </div>
+        <div class="kpi">
+            <span class="label">Memory</span>
+            <span class="value">${num(mem)}%</span>
+            <span class="sub">${num(system.memory?.usedGb, 1)} / ${num(system.memory?.totalGb, 1)} GB</span>
+        </div>
+        <div class="kpi">
+            <span class="label">Temperature</span>
+            <span class="value" style="color:${typeof temp === 'number' && temp >= 75
+            ? 'var(--critical)'
+            : typeof temp === 'number' && temp >= 65
+                ? 'var(--warning)'
+                : 'inherit'}">${num(temp, 1)}&deg;C</span>
+            <span class="sub">${system.cpu?.governor ?? '-'} governor</span>
+        </div>`;
+    };
+
+    const renderResources = (data) =>
+    {
+        const system = data.system ?? {};
+        const cpu = system.cpu ?? {};
+        const memory = system.memory ?? {};
+        const swap = system.swap ?? {};
+
+        $('cpu-meters').innerHTML = meter('CPU busy', `${num(cpu.busyPercent)}%`, cpu.busyPercent) + meter('Load (1m, normalised to cores)',
+            `${num(system.loadAverage?.[0], 2)}`,
+            cpu.cores
+                ? (system.loadAverage?.[0] / cpu.cores) * 100
+                : null);
+
+        $('cores').innerHTML = (cpu.perCorePercent ?? []).map((value, index) => `
+        <div>
+            <div class="core-label"><span>core ${index}</span><span>${num(value)}%</span></div>
+            <div class="track"><div class="fill ${severity(value)}" style="width:${Math.max(0, Math.min(100, value ?? 0))}%"></div></div>
+        </div>`).join('');
+
+        const swapBlock = swap.totalGb
+            ? meter('Swap', `${num(swap.usedGb, 2)} / ${num(swap.totalGb, 2)} GB`, swap.percent)
+            : `<div class="meter"><div class="meter-head">
+               <span class="meter-name">Swap</span>
+               <span class="meter-value" style="color:var(--warning)">none configured</span>
+           </div></div>`;
+
+        $('mem-meters').innerHTML = meter('Memory used', `${num(memory.usedGb, 2)} / ${num(memory.totalGb, 2)} GB`, memory.percent) + meter('Buffers &amp; cache',
+            `${num(memory.buffCacheGb, 2)} GB`,
+            memory.totalGb
+                ? (memory.buffCacheGb / memory.totalGb) * 100
+                : null) + swapBlock;
+    };
+
+    const renderServices = (data) =>
+    {
+        const services = data.services ?? [];
+        const categories = [...new Set(services.map((service) => service.category))];
+
+        $('services').innerHTML = categories.map((category) =>
+        {
+            const rows = services
+                .filter((service) => service.category === category)
+                .map((service) => `
+            <div class="svc ${stateClass(service.online)}">
+                <div class="svc-main">
+                    <div class="svc-name">${esc(service.name)}${service.critical
+                    ? '<span class="crit" title="critical service">&#9733;</span>'
+                    : ''}</div>
+                    <div class="svc-detail">${esc(service.detail ?? '')}${service.latencyMs != null
+                    ? ` &middot; ${service.latencyMs}ms`
+                    : ''} &middot; ${fmtAgo(service.since)}</div>
+                </div>
+                ${badge(service.online)}
+            </div>`).join('');
+
+            return `<div class="cat"><h3 class="cat-name">${esc(category)}</h3><div class="svc-grid">${rows}</div></div>`;
+        }).join('');
+    };
+
+    const renderWatchdog = (data) =>
+    {
+        const watchdog = data.watchdog;
+
+        if (!watchdog)
+        {
+            $('watchdog').innerHTML = '<span class="stamp">No watchdog state file. The stuck detector is not running.</span>';
+            return;
+        }
+
+        const gates = Object.entries(watchdog.gates ?? {});
+
+        $('watchdog').innerHTML = `
+        <div class="kv" style="margin-bottom:14px">
+            <div><span class="k">Hardware petting</span><span class="v">${watchdog.petting
+            ? 'yes'
+            : 'STOPPED'}</span></div>
+            <div><span class="k">Health-gated reboot</span><span class="v">${watchdog.armed
+            ? 'armed'
+            : 'observe only'}</span></div>
+            <div><span class="k">Last pet</span><span class="v">${fmtAgo(watchdog.lastPet)} ago</span></div>
+            <div><span class="k">Fail threshold</span><span class="v">${watchdog.failThreshold ?? '-'} checks</span></div>
+        </div>
+        <div class="svc-grid">
+            ${gates.map(([name, failures]) => `
+                <div class="svc ${failures > 0
+            ? 'is-offline'
+            : 'is-online'}">
+                    <div class="svc-main">
+                        <div class="svc-name">${esc(name)} gate</div>
+                        <div class="svc-detail">${failures > 0
+            ? `${failures} consecutive failure(s)`
+            : 'passing'}</div>
+                    </div>
+                    ${badge(failures === 0)}
+                </div>`).join('')}
+        </div>`;
+    };
+
+    const renderStorageNetwork = (data) =>
+    {
+        const disks = data.system?.disks ?? [];
+        const network = data.system?.network ?? [];
+
+        $('disks').innerHTML = '<div class="meter-name" style="margin-bottom:10px">Filesystems</div>' + disks.map((disk) => meter(disk.mount,
+            `${num(disk.usedGb, 1)} / ${num(disk.sizeGb, 1)} GB`,
+            disk.percent,
+            80,
+            92)).join('');
+
+        $('network').innerHTML = `<div class="meter-name" style="margin-bottom:10px">Interfaces</div>
+        <div class="table-scroll"><table>
+            <thead><tr><th>Interface</th><th class="num">RX</th><th class="num">TX</th><th class="num">Total RX</th><th class="num">Total TX</th></tr></thead>
+            <tbody>${network.map((iface) => `
+                <tr>
+                    <td>${esc(iface.iface)}</td>
+                    <td class="num">${num(iface.rxKbps, 1)} kbps</td>
+                    <td class="num">${num(iface.txKbps, 1)} kbps</td>
+                    <td class="num">${num(iface.rxBytes / 1073741824, 2)} GB</td>
+                    <td class="num">${num(iface.txBytes / 1073741824, 2)} GB</td>
+                </tr>`).join('')}</tbody>
+        </table></div>`;
+    };
+
+    const renderProcesses = (data) =>
+    {
+        const top = data.system?.processes?.top ?? [];
+
+        $('procs').innerHTML = `<table>
+        <thead><tr><th>Process</th><th class="num">PID</th><th class="num">CPU</th><th class="num">Memory</th></tr></thead>
+        <tbody>${top.map((proc) => `
+            <tr>
+                <td>${esc(proc.name)}</td>
+                <td class="num">${proc.pid}</td>
+                <td class="num">${num(proc.cpuPercent, 1)}%</td>
+                <td class="num">${num(proc.memMb, 1)} MB</td>
+            </tr>`).join('')}</tbody>
+    </table>
+    <div class="stamp" style="margin-top:10px">${data.system?.processes?.total ?? '-'} processes total</div>`;
+    };
+
+    const renderMachine = (data) =>
+    {
+        const system = data.system ?? {};
+        const cpu = system.cpu ?? {};
+
+        const rows = [
+            [
+                'Hostname',
+                system.host
+            ],
+            [
+                'Model',
+                system.model
+            ],
+            [
+                'OS',
+                system.os
+            ],
+            [
+                'Kernel',
+                system.kernel
+            ],
+            [
+                'Architecture',
+                system.arch
+            ],
+            [
+                'CPU cores',
+                cpu.cores
+            ],
+            [
+                'CPU frequency',
+                cpu.currentMhz
+                    ? `${cpu.currentMhz} MHz (max ${cpu.maxMhz})`
+                    : null
+            ],
+            [
+                'Governor',
+                cpu.governor
+            ],
+            [
+                'Power',
+                system.undervoltage
+                    ? (system.undervoltage.detected
+                        ? 'UNDERVOLTAGE'
+                        : 'rail nominal')
+                    : null
+            ],
+            [
+                'Running processes',
+                cpu.runningProcesses
+            ],
+            [
+                'Uptime',
+                fmtUptime(system.uptimeSeconds)
+            ]
+        ];
+
+        $('machine').innerHTML = rows
+            .filter(([, value]) => value != null && value !== '')
+            .map(([key, value]) => `<div><span class="k">${esc(key)}</span><span class="v">${esc(value)}</span></div>`)
+            .join('');
+    };
+
+    const CHART_W = 600;
+    const CHART_H = 130;
+    const PAD_L = 34;
+    const PAD_R = 8;
+    const PAD_T = 8;
+    const PAD_B = 16;
+
+    const SERIES_BLUE = '#3987e5';
+    const SERIES_GREEN = '#008300';
+
+    const niceMax = (value) =>
+    {
+        if (!(value > 0))
+        { return 1; }
+
+        const magnitude = 10 ** Math.floor(Math.log10(value));
+        const scaled = value / magnitude;
+        const step = scaled <= 1
+            ? 1
+            : scaled <= 2
+                ? 2
+                : scaled <= 5
+                    ? 5
+                    : 10;
+
+        return step * magnitude;
+    };
+
+    const buildChart = (id, title, samples, series, {
+        unit = '',
+        fixedMax = null,
+        digits = 0,
+        wide = false
+    }) =>
+    {
+        const values = series.flatMap((s) => samples.map((sample) => sample[s.key]).filter((v) => typeof v === 'number'));
+
+        if (!samples.length || !values.length)
+        {
+            return `<div class="chart-card${wide
+                ? ' is-wide'
+                : ''}"><div class="chart-head"><span class="chart-title">${esc(title)}</span></div>
+                <div class="stamp" style="padding:36px 0;text-align:center">no data yet</div></div>`;
+        }
+
+        const dataMax = Math.max(...values);
+        const yMax = fixedMax ?? Math.max(niceMax(dataMax * 1.15), 1);
+
+        const plotW = CHART_W - PAD_L - PAD_R;
+        const plotH = CHART_H - PAD_T - PAD_B;
+
+        const x = (index) => PAD_L + (samples.length === 1
+            ? plotW / 2
+            : (index / (samples.length - 1)) * plotW);
+        const y = (value) => PAD_T + plotH - (Math.max(0, Math.min(yMax, value)) / yMax) * plotH;
+
+        const grid = [
+            0,
+            0.5,
+            1
+        ].map((fraction) =>
+        {
+            const value = yMax * fraction;
+            const yy = y(value);
+
+            return `<line class="grid" x1="${PAD_L}" y1="${yy}" x2="${CHART_W - PAD_R}" y2="${yy}"/>` + `<text class="axis" x="${PAD_L - 5}" y="${yy + 3}" text-anchor="end">${value.toFixed(digits)}</text>`;
+        }).join('');
+
+        const paths = series.map((s) =>
+        {
+            const points = samples
+                .map((sample, index) => ({
+                    index,
+                    value: sample[s.key]
+                }))
+                .filter((point) => typeof point.value === 'number');
+
+            if (!points.length)
+            { return ''; }
+
+            const d = points.map((point, i) => `${i === 0
+                ? 'M'
+                : 'L'}${x(point.index).toFixed(1)},${y(point.value).toFixed(1)}`).join(' ');
+
+            const area = series.length === 1
+                ? `<path d="${d} L${x(points[points.length - 1].index).toFixed(1)},${PAD_T + plotH} L${x(points[0].index).toFixed(1)},${PAD_T + plotH} Z"
+                     fill="${s.color}" opacity="0.13"/>`
+                : '';
+
+            return `${area}<path class="line" d="${d}" stroke="${s.color}" vector-effect="non-scaling-stroke"/>`;
+        }).join('');
+
+        const legend = series.length > 1
+            ? `<div class="chart-legend">${series.map((s) => `<span class="item"><span class="swatch" style="background:${s.color}"></span>${esc(s.label)}</span>`).join('')}</div>`
+            : '';
+
+        const latest = series[0]
+            ? samples[samples.length - 1][series[0].key]
+            : null;
+        const nowText = series.length === 1 && typeof latest === 'number'
+            ? `${latest.toFixed(digits)}${unit}`
+            : '';
+
+        return `<div class="chart-card${wide
+            ? ' is-wide'
+            : ''}" id="${id}">
+        <div class="chart-head">
+            <span class="chart-title">${esc(title)}</span>
+            <span class="chart-now">${nowText}</span>
+        </div>
+        ${legend}
+        <svg class="chart-svg" viewBox="0 0 ${CHART_W} ${CHART_H}" preserveAspectRatio="none"
+             role="img" aria-label="${esc(title)} over time">
+            ${grid}
+            ${paths}
+            <line class="crosshair" id="${id}-cross" x1="0" y1="${PAD_T}" x2="0" y2="${PAD_T + plotH}" style="opacity:0"/>
+            <rect x="${PAD_L}" y="${PAD_T}" width="${plotW}" height="${plotH}" fill="transparent" id="${id}-hit"/>
+        </svg>
+        <div class="chart-tip" id="${id}-tip"></div>
+    </div>`;
+    };
+
+    const attachHover = (id, samples, series, unit, digits) =>
+    {
+        const card = $(id);
+        if (!card)
+        { return; }
+
+        const hit = $(`${id}-hit`);
+        const cross = $(`${id}-cross`);
+        const tip = $(`${id}-tip`);
+        const svg = card.querySelector('svg');
+
+        const move = (event) =>
+        {
+            const box = svg.getBoundingClientRect();
+            const ratio = (event.clientX - box.left) / box.width;
+            const plotStart = PAD_L / CHART_W;
+            const plotSpan = (CHART_W - PAD_L - PAD_R) / CHART_W;
+            const position = Math.max(0, Math.min(1, (ratio - plotStart) / plotSpan));
+            const index = Math.round(position * (samples.length - 1));
+            const sample = samples[index];
+
+            if (!sample)
+            { return; }
+
+            cross.setAttribute('x1', String(PAD_L + position * (CHART_W - PAD_L - PAD_R)));
+            cross.setAttribute('x2', String(PAD_L + position * (CHART_W - PAD_L - PAD_R)));
+            cross.style.opacity = '1';
+
+            const when = new Date(sample.t).toLocaleTimeString();
+            const rows = series
+                .filter((s) => typeof sample[s.key] === 'number')
+                .map((s) => `<span style="color:${s.color}">&#9679;</span> ${esc(s.label)}: <strong>${sample[s.key].toFixed(digits)}${unit}</strong>`)
+                .join('<br>');
+
+            tip.innerHTML = `<span class="t">${esc(when)}</span>${rows}`;
+            tip.style.opacity = '1';
+
+            const cardBox = card.getBoundingClientRect();
+            const left = event.clientX - cardBox.left + 12;
+
+            tip.style.left = `${Math.min(left, cardBox.width - tip.offsetWidth - 8)}px`;
+            tip.style.top = '34px';
+        };
+
+        hit.addEventListener('mousemove', move);
+        hit.addEventListener('mouseleave', () =>
+        {
+            cross.style.opacity = '0';
+            tip.style.opacity = '0';
+        });
+    };
+
+    const percentile = (sorted, p) =>
+    {
+        if (!sorted.length)
+        { return null; }
+        const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
+        return sorted[index];
+    };
+
+    const renderStats = (samples) =>
+    {
+        const metrics = [
+            {
+                key:      'cpu',
+                label:    'CPU busy',
+                unit:     '%',
+                digits:   0,
+                scaleMax: 100
+            },
+            {
+                key:      'mem',
+                label:    'Memory used',
+                unit:     '%',
+                digits:   0,
+                scaleMax: 100
+            },
+            {
+                key:      'temp',
+                label:    'Temperature',
+                unit:     '°C',
+                digits:   1,
+                scaleMax: 85
+            },
+            {
+                key:      'load',
+                label:    'Load (1m)',
+                unit:     '',
+                digits:   2,
+                scaleMax: 4
+            },
+            {
+                key:      'mhz',
+                label:    'CPU frequency',
+                unit:     ' MHz',
+                digits:   0,
+                scaleMax: 1800
+            },
+            {
+                key:      'rxKbps',
+                label:    'Network in',
+                unit:     ' kbps',
+                digits:   1,
+                scaleMax: null
+            },
+            {
+                key:      'txKbps',
+                label:    'Network out',
+                unit:     ' kbps',
+                digits:   1,
+                scaleMax: null
+            }
+        ];
+
+        $('stats-body').innerHTML = metrics.map((metric) =>
+        {
+            const values = samples.map((s) => s[metric.key]).filter((v) => typeof v === 'number');
+
+            if (!values.length)
+            {
+                return `<tr><td class="metric">${esc(metric.label)}</td><td colspan="6" class="stamp">no data</td></tr>`;
+            }
+
+            const sorted = [...values].sort((a, b) => a - b);
+            const min = sorted[0];
+            const max = sorted[sorted.length - 1];
+            const avg = values.reduce((total, v) => total + v, 0) / values.length;
+            const p95 = percentile(sorted, 95);
+            const now = values[values.length - 1];
+            const scale = metric.scaleMax ?? max ?? 1;
+            const width = scale > 0
+                ? Math.max(2, Math.min(100, (avg / scale) * 100))
+                : 2;
+
+            const fmt = (v) => `${v.toFixed(metric.digits)}${metric.unit}`;
+
+            return `<tr>
+            <td class="metric">${esc(metric.label)}</td>
+            <td class="num">${fmt(now)}</td>
+            <td class="num">${fmt(min)}</td>
+            <td class="num">${fmt(avg)}</td>
+            <td class="num">${fmt(max)}</td>
+            <td class="num">${fmt(p95)}</td>
+            <td><span class="stat-bar" style="width:${width.toFixed(0)}px"></span></td>
+        </tr>`;
+        }).join('');
+    };
+
+    const renderCharts = (data) =>
+    {
+        const samples = data.history ?? [];
+
+        if (!samples.length)
+        { return; }
+
+        const spanSeconds = Math.round((samples[samples.length - 1].t - samples[0].t) / 1000);
+        const minutes = Math.max(1, Math.round(spanSeconds / 60));
+
+        $('graph-window').textContent = `- last ${minutes} min, ${samples.length} samples every ${Math.round((data.intervalMs ?? 5000) / 1000)}s`;
+
+        const cpuSeries = [
+            {
+                key:   'cpu',
+                label: 'CPU',
+                color: SERIES_BLUE
+            }
+        ];
+        const memSeries = [
+            {
+                key:   'mem',
+                label: 'Memory',
+                color: SERIES_BLUE
+            }
+        ];
+        const tempSeries = [
+            {
+                key:   'temp',
+                label: 'Temp',
+                color: SERIES_BLUE
+            }
+        ];
+        const netSeries = [
+            {
+                key:   'rxKbps',
+                label: 'In',
+                color: SERIES_BLUE
+            },
+            {
+                key:   'txKbps',
+                label: 'Out',
+                color: SERIES_GREEN
+            }
+        ];
+
+        $('charts').innerHTML = [
+            buildChart('c-cpu', 'CPU busy %', samples, cpuSeries, {
+                unit:     '%',
+                fixedMax: 100,
+                digits:   0
+            }),
+            buildChart('c-mem', 'Memory used %', samples, memSeries, {
+                unit:     '%',
+                fixedMax: 100,
+                digits:   0
+            }),
+            buildChart('c-temp', 'CPU temperature °C', samples, tempSeries, {
+                unit:     '°C',
+                fixedMax: 85,
+                digits:   1
+            }),
+            buildChart('c-net', 'Network kbps', samples, netSeries, {
+                unit:   ' kbps',
+                digits: 1,
+                wide:   true
+            })
+        ].join('');
+
+        attachHover('c-cpu', samples, cpuSeries, '%', 0);
+        attachHover('c-mem', samples, memSeries, '%', 0);
+        attachHover('c-temp', samples, tempSeries, '°C', 1);
+        attachHover('c-net', samples, netSeries, ' kbps', 1);
+
+        renderStats(samples);
+        $('stats-note').textContent = `Over the last ${minutes} minutes. P95 is the value exceeded only 5% of the time - a better guide to sustained load than the peak.`;
+    };
+
+    const loadVitals = () =>
+    {
+        fetch('/pi-vitals.json', { cache: 'no-store' })
+            .then((response) => (response.ok
+                ? response.json()
+                : Promise.reject(new Error(`HTTP ${response.status}`))))
+            .then(renderCharts)
+            .catch(() =>
+            {
+
+            });
+    };
+
+    const load = () =>
+    {
+        fetch(ENDPOINT, { cache: 'no-store' })
+            .then((response) => (response.ok
+                ? response.json()
+                : Promise.reject(new Error(`HTTP ${response.status}`))))
+            .then((data) =>
+            {
+                renderAlerts(data);
+                renderKpis(data);
+                renderResources(data);
+                renderServices(data);
+                renderWatchdog(data);
+                renderStorageNetwork(data);
+                renderProcesses(data);
+                renderMachine(data);
+
+                const age = Math.round((Date.now() - Date.parse(data.generatedAt)) / 1000);
+
+                $('stamp').textContent = `updated ${age}s ago`;
+                $('stamp').style.color = age > 60
+                    ? 'var(--warning)'
+                    : '';
+                $('ident').innerHTML = `<code>${esc(data.system?.host ?? '?')}</code> &middot; ${esc(data.system?.model ?? '')} &middot; ${esc(data.system?.os ?? '')}`;
+            })
+            .catch((error) =>
+            {
+                $('stamp').textContent = `feed unavailable (${error.message})`;
+                $('stamp').style.color = 'var(--critical)';
+            });
+    };
+
+    load();
+    setInterval(load, REFRESH_MS);
+
+    loadVitals();
+    setInterval(loadVitals, VITALS_REFRESH_MS);
+</script>
+</body>
+</html>

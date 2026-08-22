@@ -1,0 +1,132 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const {
+    readJson,
+    writeJson
+} = require('../lib/uptime-history.js');
+
+const STATE_FILE = process.env.UPTIME_STATE_FILE ?? '/home/mattfor/relaxy/additions/var/uptime-history.json';
+const HEALTH_FILE = process.env.HEALTH_PUBLIC_OUTPUT ?? '/home/mattfor/relaxy/website/health.json';
+const FULL_STATE = process.env.HEALTH_STATE_FILE ?? '/home/mattfor/relaxy/additions/var/health-state.json';
+
+const WINDOW_DAYS = 90;
+const DAY_MS = 86400000;
+
+const dayKey = (timestamp) => new Date(timestamp).toISOString().slice(0, 10);
+
+const shiftDay = (key, days) =>
+{
+    const date = new Date(`${key}T00:00:00Z`);
+
+    date.setUTCDate(date.getUTCDate() + days);
+
+    return date.toISOString().slice(0, 10);
+};
+
+const main = async () =>
+{
+    const write = process.argv.includes('--write');
+    const force = process.argv.includes('--force');
+
+    const existing = await readJson(STATE_FILE, null);
+
+    if (existing && !force)
+    {
+        console.error(`A ledger already exists at ${STATE_FILE}.`);
+        console.error('Seeding it again would double-count. Pass --force if you really mean to replace it.');
+        process.exit(1);
+    }
+
+    const health = await readJson(HEALTH_FILE, null);
+
+    if (!health || !Array.isArray(health.services))
+    {
+        console.error(`Could not read ${HEALTH_FILE}. Is relaxy-health running?`);
+        process.exit(1);
+    }
+
+    const authoritative = await readJson(FULL_STATE, {}) ?? {};
+
+    const now = Date.now();
+    const windowStart = now - ((WINDOW_DAYS - 1) * DAY_MS);
+    const days = {};
+    const report = [];
+
+    for (const service of health.services)
+    {
+        const record = authoritative[service.key] ?? service;
+
+        if (record.online !== true || !record.since)
+        {
+            report.push(`  ${service.name}: skipped (not currently up)`);
+
+            continue;
+        }
+
+        const from = Math.max(Date.parse(record.since), windowStart);
+
+        if (!Number.isFinite(from) || from >= now)
+        {
+            report.push(`  ${service.name}: skipped (no usable timestamp)`);
+
+            continue;
+        }
+
+        days[service.key] = {};
+
+        let cursor = from;
+
+        while (cursor < now)
+        {
+            const day = dayKey(cursor);
+            const midnight = Date.parse(`${shiftDay(day, 1)}T00:00:00Z`);
+            const slice = Math.min(now, midnight) - cursor;
+
+            days[service.key][day] = {
+                up:      slice / 1000,
+                down:    0,
+                unknown: 0
+            };
+            cursor += slice;
+        }
+
+        const dayCount = Object.keys(days[service.key]).length;
+
+        report.push(`  ${service.name}: ${dayCount} day${dayCount === 1
+            ? ''
+            : 's'} backfilled from ${new Date(from).toISOString()}`);
+    }
+
+    console.log('');
+    console.log(write
+        ? 'Seeding the uptime ledger:'
+        : 'Dry run - nothing written. Pass --write to apply:');
+    console.log(report.join('\n'));
+    console.log('');
+
+    if (!write)
+    {
+        return;
+    }
+
+    await writeJson(STATE_FILE, {
+        version:   1,
+        days,
+        incidents: existing?.incidents ?? [],
+
+        lastTickAt: null,
+        seededAt:   new Date(now).toISOString()
+    });
+
+    console.log(`Written to ${STATE_FILE}.`);
+    console.log('relaxy-health will pick it up on its next restart; everything from now on is directly observed.');
+    console.log('');
+};
+
+main().catch((error) =>
+{
+    console.error(`relaxy-uptime-seed: ${error.message}`);
+    process.exit(1);
+});

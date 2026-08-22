@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+CONFIG_FILE="${CONFIG_FILE:-/etc/relaxy-watchdog.conf}"
+
+INTERVAL=60
+SSH_NICE=-20
+SSH_OOM_SCORE=-1000
+
+PROTECT_PATTERNS="relaxy-watchdog"
+
+[ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+NFT_RULES="${NFT_RULES:-/etc/nftables-ssh-prio.nft}"
+
+log()
+{
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+    logger -t ssh-priority -p daemon.info -- "$*" 2>/dev/null || true
+}
+
+apply_nft_rules()
+{
+    if [ ! -r "$NFT_RULES" ]; then
+        log "no nftables rules at ${NFT_RULES} - skipping network priority"
+        return
+    fi
+
+    if ! nft -c -f "$NFT_RULES" 2>/dev/null; then
+        log "WARNING: ${NFT_RULES} failed to parse - leaving the ruleset untouched"
+        return
+    fi
+
+    nft delete table inet ssh_prio 2>/dev/null || true
+
+    if nft -f "$NFT_RULES" 2>/dev/null; then
+        log "applied SSH network priority (DSCP CS6 on port ${SSH_PORT:-22})"
+    else
+        log "WARNING: failed to apply ${NFT_RULES}"
+    fi
+}
+
+protect_pid()
+{
+    local pid="$1"
+    local nice_level="$2"
+    local oom="$3"
+
+    [ -d "/proc/$pid" ] || return 0
+
+    echo "$oom" > "/proc/$pid/oom_score_adj" 2>/dev/null
+    renice -n "$nice_level" -p "$pid" >/dev/null 2>&1
+    ionice -c 1 -n 0 -p "$pid" >/dev/null 2>&1
+}
+
+ssh_pids()
+{
+    pgrep -f '(^|/)sshd($|:| )' 2>/dev/null
+}
+
+apply_nft_rules
+
+log "starting - reapplying SSH priority every ${INTERVAL}s (nice=${SSH_NICE}, oom_score_adj=${SSH_OOM_SCORE}, ionice=realtime)"
+
+first_pass=1
+last_pids=""
+
+while :; do
+    current_pids=$(ssh_pids | sort -un | tr '\n' ' ')
+
+    if [ "$current_pids" = "$last_pids" ] && [ "$first_pass" = "0" ]; then
+        sleep "$INTERVAL"
+        continue
+    fi
+
+    count=0
+
+    for pid in $current_pids; do
+        protect_pid "$pid" "$SSH_NICE" "$SSH_OOM_SCORE"
+        count=$((count + 1))
+    done
+
+    for pattern in $PROTECT_PATTERNS; do
+        for pid in $(pgrep -f "$pattern" 2>/dev/null); do
+            protect_pid "$pid" "$SSH_NICE" "$SSH_OOM_SCORE"
+        done
+    done
+
+    if [ "$first_pass" = "1" ]; then
+        log "protected ${count} sshd process(es); will only reapply when the set changes"
+        first_pass=0
+    else
+        log "sshd process set changed - reapplied priority to ${count} process(es)"
+    fi
+
+    last_pids="$current_pids"
+
+    sleep "$INTERVAL"
+done

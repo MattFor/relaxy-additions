@@ -1,0 +1,1113 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const readline = require('node:readline/promises');
+const {
+    stdin,
+    stdout
+} = require('node:process');
+
+const {
+    createLedger,
+    readJson,
+    writeJson,
+    formatDuration,
+    normalizeNotes,
+    sanitiseUpdates,
+    noteWrittenAt,
+    resolutionWrittenAt,
+    repeatRuns,
+    CAUSE_TEXT,
+    IMPACTS,
+    UPDATE_STATUSES
+} = require('../lib/uptime-history.js');
+
+const { createAnnouncer } = require('../lib/discord-outages.js');
+
+const announcer = createAnnouncer();
+
+const STATE_FILE = process.env.UPTIME_STATE_FILE ?? '/home/mattfor/relaxy/additions/var/uptime-history.json';
+const NOTES_FILE = process.env.UPTIME_NOTES_FILE ?? '/home/mattfor/relaxy/additions/var/incident-notes.json';
+const PUBLIC_FILE = process.env.UPTIME_PUBLIC_FILE ?? '/home/mattfor/relaxy/website/uptime/uptime.json';
+const HEALTH_FILE = process.env.HEALTH_PUBLIC_OUTPUT ?? '/home/mattfor/relaxy/website/health.json';
+
+const colour = stdout.isTTY
+    ? {
+        dim:    (text) => `\u001b[2m${text}\u001b[0m`,
+        bold:   (text) => `\u001b[1m${text}\u001b[0m`,
+        red:    (text) => `\u001b[31m${text}\u001b[0m`,
+        green:  (text) => `\u001b[32m${text}\u001b[0m`,
+        yellow: (text) => `\u001b[33m${text}\u001b[0m`,
+        pink:   (text) => `\u001b[95m${text}\u001b[0m`
+    }
+    : new Proxy({}, { get: () => (text) => text });
+
+const die = (message) =>
+{
+    console.error(`relaxy-incident: ${message}`);
+    process.exit(1);
+};
+
+const parseArgs = (argv) =>
+{
+    const flags = {};
+    const positional = [];
+
+    for (let index = 0; index < argv.length; index += 1)
+    {
+        const arg = argv[index];
+
+        if (arg.startsWith('--'))
+        {
+            const name = arg.slice(2);
+            const next = argv[index + 1];
+
+            if (next === undefined || next.startsWith('--'))
+            {
+                flags[name] = true;
+            }
+            else
+            {
+                flags[name] = next;
+                index += 1;
+            }
+        }
+        else
+        {
+            positional.push(arg);
+        }
+    }
+
+    return {
+        flags,
+        positional
+    };
+};
+
+const localTime = (iso) => new Date(iso).toLocaleString(undefined, {
+    year:      'numeric',
+    month:     'short',
+    day:       '2-digit',
+    hour:      '2-digit',
+    minute:    '2-digit',
+    hourCycle: 'h23'
+});
+
+const clockTime = (iso) => new Date(iso).toLocaleString(undefined, {
+    hour:      '2-digit',
+    minute:    '2-digit',
+    hourCycle: 'h23'
+});
+
+const annotatedBy = (notes, id) =>
+{
+    const note = notes.notes[id];
+
+    return Boolean(note && (note.title || note.note || note.resolution || (note.updates ?? []).length));
+};
+
+const degradationOf = (run, notes) =>
+{
+    const members = run.members;
+    const first = members[0];
+    const last = members[members.length - 1];
+    const ongoing = members.some((member) => !member.endedAt);
+
+    const downSeconds = members.reduce((sum, member) => sum + (member.durationSeconds ?? 0), 0);
+
+    return {
+        ...first,
+        endedAt:     ongoing
+                         ? null
+                         : last.endedAt,
+        degraded:    true,
+        outages:     members.length,
+        repeats:     members,
+        downSeconds,
+        spanSeconds: Math.max(0, Math.round((run.endedAt - run.startedAt) / 1000)),
+        annotated:   annotatedBy(notes, first.id)
+    };
+};
+
+const loadAll = async () =>
+{
+    const state = await readJson(STATE_FILE, null);
+    const notes = normalizeNotes(await readJson(NOTES_FILE, null));
+
+    const detected = (Array.isArray(state?.incidents)
+        ? state.incidents
+        : [])
+        .map((incident) => ({
+            ...incident,
+            manual: false
+        }));
+
+    const declared = notes.manual.map((incident) => ({
+        ...incident,
+        manual: true
+    }));
+
+    if (!state && !declared.length)
+    {
+        die(`no ledger at ${STATE_FILE} yet - relaxy-health writes it once it has seen a service change state.`);
+    }
+
+    const now = Date.now();
+
+    const grouped = repeatRuns(detected, now, (incident) => ({
+        repeatable: incident.scope !== 'host' && Boolean(incident.service),
+        service:    incident.service,
+        causeCode:  incident.cause?.code,
+        startedAt:  incident.startedAt,
+        endedAt:    incident.endedAt,
+        annotated:  annotatedBy(notes, incident.id)
+    }))
+        .map((run) => (run.members.length < 2
+            ? run.members[0]
+            : degradationOf(run, notes)));
+
+    const incidents = [
+        ...grouped,
+        ...declared
+    ]
+        .sort((a, b) => Date.parse(b.startedAt) - Date.parse(a.startedAt));
+
+    return {
+        incidents,
+        notes
+    };
+};
+
+const publicServices = async () =>
+{
+    const health = await readJson(HEALTH_FILE, null);
+
+    return Array.isArray(health?.services)
+        ? health.services
+        : [];
+};
+
+const writeNotes = (notes) => writeJson(NOTES_FILE, {
+    version: 2,
+    notes:   notes.notes,
+    manual:  notes.manual
+});
+
+const recordFor = (notes, incident) => (incident.manual
+    ? notes.manual.find((candidate) => candidate.id === incident.id)
+    : notes.notes[incident.id] ??= {});
+
+const appendUpdate = (record, body, status) =>
+{
+    record.updates = Array.isArray(record.updates)
+        ? record.updates
+        : [];
+    record.updates.push({
+        at:     new Date().toISOString(),
+        status: UPDATE_STATUSES.includes(status)
+                    ? status
+                    : 'update',
+        body:   body.trim()
+    });
+};
+
+const appendClosing = (record, resolution, body) =>
+{
+    const text = typeof body === 'string'
+        ? body.trim()
+        : '';
+
+    if (text && text !== resolution)
+    {
+        appendUpdate(record, text, 'resolved');
+    }
+};
+
+const stampField = (next, existing, key, field) =>
+{
+    if (!next[key])
+    {
+        delete next[field];
+    }
+    else if (next[key] !== existing[key])
+    {
+        next[field] = new Date().toISOString();
+    }
+};
+
+const resolve = (incidents, selector) =>
+{
+    if (!selector)
+    {
+        die('which incident? Try `relaxy-incident list` first.');
+    }
+
+    if (selector === 'latest')
+    {
+        return incidents[0] ?? die('no incidents recorded.');
+    }
+
+    const index = Number(String(selector).replace(/^#/, ''));
+
+    if (Number.isInteger(index) && index >= 1 && index <= incidents.length)
+    {
+        return incidents[index - 1];
+    }
+
+    const match = incidents.find((incident) => incident.id === selector);
+
+    if (match)
+    {
+        return match;
+    }
+
+    const member = incidents
+        .flatMap((incident) => incident.repeats ?? [])
+        .find((incident) => incident.id === selector);
+
+    return member ?? die(`no incident matches "${selector}".`);
+};
+
+const durationOf = (incident) => formatDuration(incident.degraded
+    ? incident.downSeconds
+    : Math.max(0,
+        ((incident.endedAt
+            ? Date.parse(incident.endedAt)
+            : Date.now()) - Date.parse(incident.startedAt)) / 1000));
+
+const republish = async () =>
+{
+    const health = await readJson(HEALTH_FILE, null);
+
+    if (!health || !Array.isArray(health.services))
+    {
+        return {
+            published: false,
+            announced: 0
+        };
+    }
+
+    const ledger = createLedger({
+        stateFile:  STATE_FILE,
+        notesFile:  NOTES_FILE,
+        publicFile: PUBLIC_FILE
+    });
+
+    await ledger.load();
+
+    const payload = await ledger.publish({
+        now:            Date.now(),
+        publicServices: health.services
+    });
+    const announced = await announcer.sync(payload);
+
+    return {
+        published: true,
+        announced
+    };
+};
+
+const labelOf = (incident, notes) =>
+{
+    if (incident.manual)
+    {
+        return incident.title ?? 'Declared incident';
+    }
+
+    const written = notes.notes[incident.id]?.title;
+
+    if (written)
+    {
+        return written;
+    }
+
+    if (incident.degraded)
+    {
+        return `${incident.serviceName} ${incident.endedAt
+            ? 'was unstable'
+            : 'keeps dropping out'}`;
+    }
+
+    return incident.serviceName;
+};
+
+const printPeriods = (incident) =>
+{
+    console.log('');
+    console.log(`  ${colour.bold(colour.yellow(`Outages (${incident.outages})`))}`);
+
+    incident.repeats.forEach((period) =>
+    {
+        const window = `${localTime(period.startedAt)} - ${period.endedAt
+            ? clockTime(period.endedAt)
+            : colour.red('still down')}`;
+
+        console.log(`    ${window}  ${colour.dim(formatDuration(period.durationSeconds ?? 0).padStart(6))}`);
+        console.log(`      ${colour.dim(`id ${period.id}`)}`);
+    });
+};
+
+const updatesOf = (incident, notes) =>
+{
+    const record = incident.manual
+        ? incident
+        : notes.notes[incident.id] ?? {};
+
+    return sanitiseUpdates(record.updates, record.resolution);
+};
+
+const commandList = async (flags) =>
+{
+    const {
+        incidents,
+        notes
+    } = await loadAll();
+    const shown = flags.all
+        ? incidents
+        : incidents.slice(0, 20);
+
+    if (!shown.length)
+    {
+        console.log('Nothing has gone down yet.');
+
+        return;
+    }
+
+    console.log('');
+
+    shown.forEach((incident, index) =>
+    {
+        const note = incident.manual
+            ? incident
+            : notes.notes[incident.id];
+        const ongoing = !incident.endedAt;
+        const state = ongoing
+            ? colour.red('ONGOING')
+            : colour.green('resolved');
+        const kind = incident.manual
+            ? colour.pink('declared')
+            : colour.dim('detected');
+        const posted = updatesOf(incident, notes).length;
+
+        const tag = incident.manual
+            ? (posted
+                ? colour.dim(`${posted} update${posted === 1
+                    ? ''
+                    : 's'}`)
+                : colour.yellow('no updates yet'))
+            : note
+                ? colour.pink('annotated')
+                : colour.yellow('needs a note');
+
+        console.log(`${colour.bold(`${index + 1}.`)} ${colour.bold(labelOf(incident, notes))}  ${state}  ${colour.dim(durationOf(incident))}  ${kind}  ${tag}`);
+        console.log(`   ${colour.dim(localTime(incident.startedAt))}  ${colour.dim(`id ${incident.id}`)}`);
+
+        console.log(`   ${incident.manual
+            ? incident.cause ?? colour.dim(`affects ${incident.serviceName ?? 'multiple services'}`)
+            : incident.cause?.summary ?? CAUSE_TEXT.unknown}`);
+
+        if (incident.degraded)
+        {
+            const when = incident.repeats.map((period) => clockTime(period.startedAt)).join(', ');
+
+            console.log(`   ${colour.yellow('degraded')} ${colour.dim(`${incident.outages} outages over ${formatDuration(incident.spanSeconds)}`)}` + `  ${colour.dim(when)}`);
+        }
+
+        if (!incident.manual && note?.title)
+        {
+            console.log(`   ${colour.pink('you:')} ${note.title}`);
+        }
+
+        console.log('');
+    });
+
+    if (!flags.all && incidents.length > shown.length)
+    {
+        console.log(colour.dim(`  ${incidents.length - shown.length} older. Use --all to see them.\n`));
+    }
+};
+
+const printUpdates = (updates) =>
+{
+    if (!updates.length)
+    {
+        return;
+    }
+
+    console.log('');
+    console.log(`  ${colour.bold(colour.pink('Posted updates'))} ${colour.dim('(newest first)')}`);
+
+    [...updates]
+        .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
+        .forEach((update) =>
+        {
+            console.log(`    ${colour.dim(localTime(update.at))}  ${colour.bold(update.status ?? 'update')}`);
+            console.log(`      ${update.body}`);
+        });
+};
+
+const commandShow = async (positional) =>
+{
+    const {
+        incidents,
+        notes
+    } = await loadAll();
+    const incident = resolve(incidents, positional[0]);
+    const note = incident.manual
+        ? incident
+        : notes.notes[incident.id] ?? {};
+
+    console.log('');
+    console.log(colour.bold(labelOf(incident, notes)));
+    console.log(colour.dim(`  id          ${incident.id}`));
+    console.log(`  kind        ${incident.manual
+        ? colour.pink('declared by you')
+        : colour.dim('detected by the daemon')}`);
+    console.log(`  affects     ${incident.serviceName ?? colour.dim('multiple services')}`);
+    console.log(`  started     ${localTime(incident.startedAt)}`);
+    console.log(`  ended       ${incident.endedAt
+        ? localTime(incident.endedAt)
+        : colour.red(incident.manual
+            ? 'still open'
+            : 'still down')}`);
+    console.log(`  lasted      ${durationOf(incident)}${incident.degraded
+        ? colour.dim(` down, across ${incident.outages} outages spanning ${formatDuration(incident.spanSeconds)}`)
+        : ''}`);
+
+    if (incident.manual)
+    {
+        console.log(`  impact      ${incident.impact ?? colour.dim('minor')}`);
+
+        if (incident.cause)
+        {
+            console.log('');
+            console.log(`  ${colour.bold('What you said was happening')}`);
+            console.log(`  ${incident.cause}`);
+        }
+    }
+    else
+    {
+        console.log('');
+        console.log(`  ${colour.bold('Detected cause')} ${colour.dim(`(${incident.cause?.code ?? 'unknown'}, ${incident.cause?.confidence ?? 'low'} confidence)`)}`);
+        console.log(`  ${incident.cause?.summary ?? CAUSE_TEXT.unknown}`);
+    }
+
+    if (incident.degraded)
+    {
+        printPeriods(incident);
+    }
+
+    if (!incident.manual && incident.cause?.evidence)
+    {
+        const evidence = incident.cause.evidence;
+
+        console.log('');
+        console.log(colour.dim('  evidence (not published)'));
+
+        if (evidence.detail)
+        {
+            console.log(colour.dim(`    probe          ${evidence.detail}`));
+        }
+
+        if (evidence.supervisor)
+        {
+            console.log(colour.dim(`    supervisor     ${evidence.supervisor.kind} / ${evidence.supervisor.state ?? '?'}`));
+        }
+
+        console.log(colour.dim(`    memory         ${evidence.memoryPercent ?? '?'}%`));
+        console.log(colour.dim(`    temperature    ${evidence.temperatureC ?? '?'}C`));
+        console.log(colour.dim(`    host uptime    ${evidence.uptimeSeconds != null
+            ? formatDuration(evidence.uptimeSeconds)
+            : '?'}`));
+        console.log(colour.dim(`    failed together ${evidence.simultaneous ?? 1}`));
+    }
+
+    console.log('');
+
+    const written = (text, stamp) => (text
+        ? `${text}${stamp
+            ? colour.dim(`  (written ${localTime(stamp)})`)
+            : ''}`
+        : colour.dim('-'));
+
+    if (incident.manual)
+    {
+        if (note.note || note.resolution)
+        {
+            console.log('');
+            console.log(`  ${colour.bold(colour.pink('Your notes'))}`);
+            console.log(`    what happened ${written(note.note, noteWrittenAt(note))}`);
+            console.log(`    resolution   ${written(note.resolution, resolutionWrittenAt(note))}`);
+        }
+    }
+    else if (note.title || note.note || note.resolution)
+    {
+        console.log(`  ${colour.bold(colour.pink('Your notes'))}`);
+        console.log(`    title        ${note.title ?? colour.dim('-')}`);
+        console.log(`    impact       ${note.impact ?? colour.dim('(automatic)')}`);
+        console.log(`    what happened ${written(note.note, noteWrittenAt(note))}`);
+        console.log(`    resolution   ${written(note.resolution, resolutionWrittenAt(note))}`);
+    }
+    else if (!incident.manual)
+    {
+        console.log(colour.dim(`  No notes yet. Add them with: relaxy-incident note ${incident.id}`));
+
+        if (incident.degraded)
+        {
+            console.log(colour.dim('  A note here covers the whole degradation. Noting one of the ids'));
+            console.log(colour.dim('  above instead pulls that outage out into an entry of its own.'));
+        }
+    }
+
+    printUpdates(updatesOf(incident, notes));
+
+    if (!incident.endedAt)
+    {
+        console.log('');
+        console.log(colour.dim(`  Post an update:  relaxy-incident update ${incident.id} "..."`));
+
+        if (incident.manual)
+        {
+            console.log(colour.dim(`  Mark it fixed:   relaxy-incident resolve ${incident.id}`));
+        }
+    }
+
+    console.log('');
+};
+
+const save = async (notes, message) =>
+{
+    await writeNotes(notes);
+
+    console.log('');
+    console.log(colour.green(message));
+
+    const {
+        published,
+        announced
+    } = await republish()
+        .catch(() => ({
+            published: false,
+            announced: 0
+        }));
+
+    console.log(published
+        ? colour.dim('uptime.json republished - it is live now.')
+        : colour.dim('Saved. It will appear at the daemon\'s next publish.'));
+
+    if (announced)
+    {
+        console.log(colour.dim(`Outages channel updated (${announced} message${announced === 1
+            ? ''
+            : 's'}).`));
+    }
+    else
+    {
+        console.log(await announcer.available()
+            ? colour.dim('Outages channel: already current.')
+            : colour.yellow(`Outages channel: ${announcer.reason()}.`));
+    }
+
+    console.log('');
+};
+
+const commandNote = async (positional, flags) =>
+{
+    const {
+        incidents,
+        notes
+    } = await loadAll();
+    const incident = resolve(incidents, positional[0]);
+    const existing = incident.manual
+        ? notes.manual.find((candidate) => candidate.id === incident.id)
+        : notes.notes[incident.id] ?? {};
+
+    const hasFlags = [
+        'title',
+        'note',
+        'resolution',
+        'impact'
+    ]
+        .some((key) => typeof flags[key] === 'string');
+
+    let next = { ...existing };
+
+    if (hasFlags)
+    {
+        for (const key of [
+            'title',
+            'note',
+            'resolution',
+            'impact'
+        ])
+        {
+            if (typeof flags[key] === 'string')
+            {
+                next[key] = flags[key];
+            }
+        }
+    }
+    else
+    {
+
+        const rl = readline.createInterface({
+            input:  stdin,
+            output: stdout
+        });
+
+        console.log('');
+        console.log(`${colour.bold(labelOf(incident, notes))} - ${localTime(incident.startedAt)}, ${incident.endedAt
+            ? 'lasted'
+            : 'running for'} ${durationOf(incident)}`);
+
+        console.log(colour.dim(incident.manual
+            ? 'Declared by you.'
+            : `Detected: ${incident.cause?.summary ?? CAUSE_TEXT.unknown}`));
+
+        console.log(colour.dim('Press enter to keep the current value.'));
+        console.log('');
+
+        const ask = async (label, current) =>
+        {
+            const suffix = current
+                ? colour.dim(` [${current}]`)
+                : '';
+            const answer = (await rl.question(`${label}${suffix}: `)).trim();
+
+            return answer === ''
+                ? current
+                : answer;
+        };
+
+        next.title = await ask('Title', existing.title);
+        next.note = await ask('What happened', existing.note);
+        next.resolution = await ask('How it was fixed', existing.resolution);
+        next.impact = await ask(`Impact (${IMPACTS.join('/')}, blank = automatic)`, existing.impact);
+
+        rl.close();
+    }
+
+    if (next.impact && !IMPACTS.includes(next.impact))
+    {
+        die(`impact must be one of: ${IMPACTS.join(', ')}`);
+    }
+
+    const updates = next.updates;
+
+    next = Object.fromEntries(Object.entries(next).filter(([key, value]) => value && key !== 'updates'));
+
+    if (Array.isArray(updates) && updates.length)
+    {
+        next.updates = updates;
+    }
+
+    if (!Object.keys(next).length)
+    {
+        die('nothing to save.');
+    }
+
+    stampField(next, existing, 'note', 'noteAt');
+    stampField(next, existing, 'resolution', 'resolutionAt');
+
+    next.updatedAt = new Date().toISOString();
+
+    if (incident.manual)
+    {
+
+        const index = notes.manual.findIndex((candidate) => candidate.id === incident.id);
+
+        notes.manual[index] = {
+            ...notes.manual[index], ...next,
+            id:        incident.id,
+            startedAt: incident.startedAt,
+            endedAt:   incident.endedAt ?? null
+        };
+    }
+    else
+    {
+        notes.notes[incident.id] = next;
+    }
+
+    await save(notes, `Saved to ${labelOf(incident, notes)}.`);
+};
+
+const commandOpen = async (flags) =>
+{
+    const services = await publicServices();
+    const notes = normalizeNotes(await readJson(NOTES_FILE, null));
+
+    const rl = [
+        'title',
+        'service',
+        'impact',
+        'cause'
+    ].some((key) => typeof flags[key] === 'string')
+        ? null
+        : readline.createInterface({
+            input:  stdin,
+            output: stdout
+        });
+
+    const ask = async (label, fallback) =>
+    {
+        if (!rl)
+        {
+            return fallback;
+        }
+
+        const answer = (await rl.question(`${label}: `)).trim();
+
+        return answer === ''
+            ? fallback
+            : answer;
+    };
+
+    if (rl)
+    {
+        console.log('');
+        console.log(colour.bold('Declaring an outage.'));
+        console.log(colour.dim('This goes straight onto the status page as an active incident.'));
+        console.log(colour.dim(`Services: ${services.map((service) => service.key).join(', ')} (blank = affects everything)`));
+        console.log('');
+    }
+
+    const title = typeof flags.title === 'string'
+        ? flags.title
+        : await ask('Title', null);
+
+    if (!title)
+    {
+        rl?.close();
+        die('an incident needs a title - it is the headline people read.');
+    }
+
+    const serviceRaw = typeof flags.service === 'string'
+        ? flags.service
+        : await ask('Affected service (blank = all)', null);
+    const impactRaw = typeof flags.impact === 'string'
+        ? flags.impact
+        : await ask(`Impact (${IMPACTS.join('/')})`, 'major');
+    const cause = typeof flags.cause === 'string'
+        ? flags.cause
+        : await ask('What is going on', null);
+    const body = typeof flags.body === 'string'
+        ? flags.body
+        : await ask('First update (blank = none)', null);
+
+    rl?.close();
+
+    const service = serviceRaw && serviceRaw !== 'none' && serviceRaw !== 'all'
+        ? serviceRaw
+        : null;
+
+    if (service && !services.some((candidate) => candidate.key === service))
+    {
+        die(`no public service called "${service}". Known: ${services.map((candidate) => candidate.key).join(', ')}`);
+    }
+
+    const impact = IMPACTS.includes(impactRaw)
+        ? impactRaw
+        : null;
+
+    if (!impact)
+    {
+        die(`impact must be one of: ${IMPACTS.join(', ')}`);
+    }
+
+    const startedAt = typeof flags.at === 'string'
+        ? new Date(flags.at)
+        : new Date();
+
+    if (Number.isNaN(startedAt.getTime()))
+    {
+        die(`could not read "${flags.at}" as a time. Try an ISO timestamp, or leave --at off for now.`);
+    }
+
+    const incident = {
+        id:          `manual-${startedAt.toISOString().replace(/[:.]/g, '-')}`,
+        title,
+        service,
+        serviceName: service
+                         ? services.find((candidate) => candidate.key === service)?.name ?? service
+                         : 'Multiple services',
+        impact,
+        startedAt:   startedAt.toISOString(),
+        endedAt:     null,
+        cause:       cause ?? null,
+        updates:     [],
+        createdAt:   new Date().toISOString()
+    };
+
+    if (notes.manual.some((candidate) => candidate.id === incident.id))
+    {
+        die('an incident already starts at that exact moment. Pass --at to shift it, or update the existing one.');
+    }
+
+    if (body)
+    {
+        appendUpdate(incident, body, flags.status ?? 'investigating');
+    }
+
+    notes.manual.push(incident);
+
+    await save(notes, `Declared "${title}". It is live on the status page as an active incident.`);
+
+    console.log(colour.dim(`  Post updates with:  relaxy-incident update ${incident.id} "..."`));
+    console.log(colour.dim(`  Close it with:      relaxy-incident resolve ${incident.id}`));
+    console.log('');
+};
+
+const commandUpdate = async (positional, flags) =>
+{
+    const {
+        incidents,
+        notes
+    } = await loadAll();
+    const incident = resolve(incidents, positional[0]);
+    const body = positional.slice(1).join(' ').trim() || (typeof flags.body === 'string'
+        ? flags.body.trim()
+        : '');
+
+    if (!body)
+    {
+        die(`an update needs something to say. Try: relaxy-incident update ${positional[0] ?? '1'} "what changed"`);
+    }
+
+    if (flags.status && !UPDATE_STATUSES.includes(flags.status))
+    {
+        die(`status must be one of: ${UPDATE_STATUSES.join(', ')}`);
+    }
+
+    const record = recordFor(notes, incident);
+
+    if (!record)
+    {
+        die('could not find that incident to update.');
+    }
+
+    appendUpdate(record, body, flags.status);
+    record.updatedAt = new Date().toISOString();
+
+    await save(notes, `Update posted to "${labelOf(incident, notes)}".`);
+};
+
+const commandResolve = async (positional, flags) =>
+{
+    const {
+        incidents,
+        notes
+    } = await loadAll();
+    const incident = resolve(incidents, positional[0]);
+    const resolution = typeof flags.resolution === 'string'
+        ? flags.resolution.trim()
+        : null;
+
+    const record = recordFor(notes, incident);
+
+    if (!record)
+    {
+        die('could not find that incident to resolve.');
+    }
+
+    if (resolution)
+    {
+        if (resolution !== record.resolution)
+        {
+            record.resolutionAt = new Date().toISOString();
+        }
+
+        record.resolution = resolution;
+    }
+
+    if (!incident.manual)
+    {
+        appendClosing(record, resolution, flags.body);
+
+        record.updatedAt = new Date().toISOString();
+
+        await save(notes, `Resolution recorded on "${labelOf(incident, notes)}".`);
+
+        console.log(incident.endedAt
+            ? colour.dim('  That incident was detected by the daemon and had already closed itself.')
+            : colour.yellow('  Note: this incident is still open because the probe is still failing.\n') + colour.dim('  It closes on its own the moment the service answers again.'));
+        console.log('');
+
+        return;
+    }
+
+    if (incident.endedAt)
+    {
+        die(`that one was already resolved at ${localTime(incident.endedAt)}.`);
+    }
+
+    const index = notes.manual.findIndex((candidate) => candidate.id === incident.id);
+    const endedAt = typeof flags.at === 'string'
+        ? new Date(flags.at)
+        : new Date();
+
+    if (Number.isNaN(endedAt.getTime()))
+    {
+        die(`could not read "${flags.at}" as a time.`);
+    }
+
+    if (endedAt.getTime() < Date.parse(incident.startedAt))
+    {
+        die('that end time is before the incident started.');
+    }
+
+    appendClosing(notes.manual[index], resolution, flags.body);
+
+    notes.manual[index].endedAt = endedAt.toISOString();
+    notes.manual[index].updatedAt = new Date().toISOString();
+
+    await save(notes, `Resolved "${incident.title}" after ${durationOf({
+        ...incident,
+        endedAt: endedAt.toISOString()
+    })}.`);
+
+    console.log(colour.dim('  It has moved out of the active list and into the incident history.'));
+    console.log('');
+};
+
+const commandDrop = async (positional) =>
+{
+    const {
+        incidents,
+        notes
+    } = await loadAll();
+    const incident = resolve(incidents, positional[0]);
+
+    if (!incident.manual)
+    {
+        die('that incident was detected by the daemon, not declared by you. Its record is the measurement and cannot be deleted here - use `clear` to remove your notes from it.');
+    }
+
+    notes.manual = notes.manual.filter((candidate) => candidate.id !== incident.id);
+
+    await save(notes, `Deleted "${incident.title}" and everything posted to it.`);
+};
+
+const commandClear = async (positional) =>
+{
+    const {
+        incidents,
+        notes
+    } = await loadAll();
+    const incident = resolve(incidents, positional[0]);
+
+    if (incident.manual)
+    {
+        die('that incident was declared by you, so its notes ARE the incident. Use `drop` to delete it outright.');
+    }
+
+    if (!notes.notes[incident.id])
+    {
+        die('that incident has no notes to clear.');
+    }
+
+    delete notes.notes[incident.id];
+
+    await save(notes, `Cleared notes on ${incident.serviceName}'s incident. The incident itself is untouched.`);
+};
+
+const usage = () =>
+{
+    console.log(`
+${colour.bold('relaxy-incident')} - the outages shown on uptime.relaxy.xyz
+
+  ${colour.bold('Looking')}
+  list [--all]                 recent incidents, newest first
+  show <id|N>                  everything recorded about one incident
+
+  ${colour.bold('Annotating what the daemon found')}
+  note <id|N> [flags]          add or edit your notes (interactive with no flags)
+  clear <id|N>                 remove your notes, keep the incident
+
+  ${colour.bold('Declaring an outage yourself')}
+  open [flags]                 start an incident (interactive with no flags)
+  update <id|N> "..."          post an update onto a running incident
+  resolve <id|N>               mark it fixed - moves it into the history
+  drop <id|N>                  delete one you declared, updates and all
+
+  Flags for note:
+    --title "..."              headline shown on the page
+    --note "..."               what actually happened
+    --resolution "..."         how it was fixed
+    --impact ${IMPACTS.join('|')}
+
+  Flags for open:
+    --title "..."              headline shown on the page
+    --service <key>            which service, or leave it off for site-wide
+    --impact ${IMPACTS.join('|')}
+    --cause "..."              what is going on, in a sentence
+    --body "..."               the first update to post
+    --at <time>                when it really started (default: now)
+
+  Flags for update:
+    --status ${UPDATE_STATUSES.join('|')}
+
+  Flags for resolve:
+    --resolution "..."         how it was fixed - shown as the last line of the card
+    --body "..."               a closing update, only if it says something else
+    --at <time>                when it really ended (default: now)
+
+  N is a position from \`list\` - 1 is the most recent.
+
+  ${colour.dim('Detected incidents open and close by themselves, from the probes. Declared')}
+  ${colour.dim('ones are yours: they show as active until you resolve them, and they never')}
+  ${colour.dim('change the measured uptime percentages.')}
+
+  ${colour.dim('Everything here also goes to the Discord outages channel: opening posts a')}
+  ${colour.dim('message, updates and resolutions edit it and reply with the news. Each')}
+  ${colour.dim('command says whether the channel heard it.')}
+`);
+};
+
+const main = async () =>
+{
+    const {
+        flags,
+        positional
+    } = parseArgs(process.argv.slice(2));
+    const command = positional.shift() ?? 'list';
+
+    if (flags.help)
+    {
+        return usage();
+    }
+
+    switch (command)
+    {
+        case 'list':
+            return commandList(flags);
+        case 'show':
+            return commandShow(positional);
+        case 'note':
+        case 'annotate':
+            return commandNote(positional, flags);
+        case 'clear':
+            return commandClear(positional);
+        case 'open':
+        case 'declare':
+            return commandOpen(flags);
+        case 'update':
+            return commandUpdate(positional, flags);
+        case 'resolve':
+        case 'close':
+            return commandResolve(positional, flags);
+        case 'drop':
+        case 'delete':
+            return commandDrop(positional);
+        case 'help':
+        case '--help':
+            return usage();
+        default:
+            die(`unknown command "${command}". Try \`relaxy-incident help\`.`);
+    }
+};
+
+main().catch((error) =>
+{
+    die(error.message);
+});

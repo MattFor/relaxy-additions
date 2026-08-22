@@ -1,0 +1,1619 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const {
+    readFile,
+    writeFile,
+    rename,
+    mkdir
+} = require('node:fs/promises');
+const { execFile } = require('node:child_process');
+const net = require('node:net');
+const dns = require('node:dns');
+const os = require('node:os');
+const path = require('node:path');
+
+const { createLedger } = require('../lib/uptime-history.js');
+const { createAnnouncer } = require('../lib/discord-outages.js');
+
+const FULL_OUTPUT = process.env.HEALTH_FULL_OUTPUT ?? '/home/mattfor/stats/pi-health.json';
+const PUBLIC_OUTPUT = process.env.HEALTH_PUBLIC_OUTPUT ?? '/home/mattfor/relaxy/website/health.json';
+const STATE_FILE = process.env.HEALTH_STATE_FILE ?? '/home/mattfor/relaxy/additions/var/health-state.json';
+const WATCHDOG_FILE = process.env.WATCHDOG_STATE_FILE ?? '/run/relaxy-watchdog.json';
+
+const STATUS_FILE = process.env.HEALTH_STATUS_FILE ?? '/home/mattfor/relaxy/website/status.json';
+
+const UPTIME_STATE_FILE = process.env.UPTIME_STATE_FILE ?? '/home/mattfor/relaxy/additions/var/uptime-history.json';
+const UPTIME_NOTES_FILE = process.env.UPTIME_NOTES_FILE ?? '/home/mattfor/relaxy/additions/var/incident-notes.json';
+const UPTIME_PUBLIC_FILE = process.env.UPTIME_PUBLIC_FILE ?? '/home/mattfor/relaxy/website/uptime/uptime.json';
+
+const UPTIME_PUBLISH_EVERY = Number(process.env.UPTIME_PUBLISH_EVERY ?? 6);
+
+const UPTIME_PUBLISH_EVERY_ACTIVE = Number(process.env.UPTIME_PUBLISH_EVERY_ACTIVE ?? 3);
+
+const INTERVAL_MS = Number(process.env.HEALTH_INTERVAL_MS ?? 10000);
+
+const COLLECTORS = [
+    {
+        key:        'containers',
+        intervalMs: 120000,
+        offsetMs:   7000
+    },
+    {
+        key:        'procs',
+        intervalMs: 60000,
+        offsetMs:   27000
+    },
+    {
+        key:        'tmux',
+        intervalMs: 60000,
+        offsetMs:   47000
+    },
+    {
+        key:        'disks',
+        intervalMs: 300000,
+        offsetMs:   67000
+    }
+];
+
+const VITALS_INTERVAL_MS = Number(process.env.HEALTH_VITALS_INTERVAL_MS ?? 5000);
+const VITALS_HISTORY = Number(process.env.HEALTH_VITALS_HISTORY ?? 180);
+const VITALS_OUTPUT = process.env.HEALTH_VITALS_OUTPUT ?? '/home/mattfor/stats/pi-vitals.json';
+const PROBE_TIMEOUT_MS = Number(process.env.HEALTH_PROBE_TIMEOUT_MS ?? 4000);
+const SSH_PORT = Number(process.env.SSH_PORT ?? 22);
+
+const STATUS_STALE_MS = 90 * 1000;
+
+const CLK_TCK = 100;
+
+const readFleetStatus = async (now) =>
+{
+    const raw = await readText(STATUS_FILE);
+
+    if (!raw)
+    {
+        return {
+            ok:     false,
+            reason: 'missing',
+            ageMs:  null,
+            data:   null
+        };
+    }
+
+    let data = null;
+
+    try
+    {
+        data = JSON.parse(raw);
+    }
+    catch
+    {
+        return {
+            ok:     false,
+            reason: 'unparseable',
+            ageMs:  null,
+            data:   null
+        };
+    }
+
+    const ageMs = Math.max(0, now - Date.parse(data.generatedAt));
+
+    if (!Number.isFinite(ageMs))
+    {
+        return {
+            ok:     false,
+            reason: 'undated',
+            ageMs:  null,
+            data
+        };
+    }
+
+    if (ageMs > STATUS_STALE_MS)
+    {
+        return {
+            ok:     false,
+            reason: 'stale',
+            ageMs,
+            data
+        };
+    }
+
+    return {
+        ok:     true,
+        reason: null,
+        ageMs,
+        data
+    };
+};
+
+const fleetBlind = (status) =>
+{
+    if (!status.data)
+    {
+
+        return {
+            ok:     false,
+            detail: `status.json ${status.reason}`
+        };
+    }
+
+    if (!status.ok)
+    {
+        return {
+            ok:     null,
+            detail: `status.json ${status.reason}${status.ageMs != null
+                ? ` (${Math.round(status.ageMs / 1000)}s old)`
+                : ''}`
+        };
+    }
+
+    return null;
+};
+
+const managerMeta = (bot) =>
+{
+    const machines = Array.isArray(bot.machines)
+        ? bot.machines
+        : [];
+
+    const primary = machines.find((machine) => machine.id === bot.primary) ?? machines.find((machine) => machine.online === true) ?? null;
+
+    const latency = primary?.latency ?? {};
+
+    const number = (value) => (Number.isFinite(value)
+        ? value
+        : null);
+
+    return {
+
+        machines:      (bot.hostCount ?? 0) > 1
+                           ? bot.hostCount
+                           : null,
+        shards:        primary
+                           ? (primary.shards ?? []).length
+                           : number(bot.totalShards),
+        clusters:      primary?.clusters ?? number(bot.totalClusters),
+        clustersReady: number(primary?.clustersReady),
+        guilds:        number(bot.totalGuilds),
+
+        worstShardMs: number(latency.worstShardMs ?? bot.worstShardMs),
+        databaseMs:   number(latency.databaseMs),
+        heartbeatMs:  number(latency.heartbeatMs),
+        startedAt:    primary?.startedAt ?? null,
+        version:      primary?.version ?? null
+    };
+};
+
+const fleetLatency = (ms, at) => ({
+    ms: Number.isFinite(ms) && ms >= 0
+            ? ms
+            : null,
+
+    at: at
+            ? Date.parse(at) || null
+            : null
+});
+
+const round = (value, digits = 0) =>
+{
+    const factor = 10 ** digits;
+    return Math.round(value * factor) / factor;
+};
+
+const run = (command, args, timeout = PROBE_TIMEOUT_MS) => new Promise((resolve) =>
+{
+    execFile(command, args, {
+        timeout,
+        encoding: 'utf8'
+    }, (error, stdout, stderr) =>
+    {
+        resolve({
+            ok:     !error,
+            code:   error?.code ?? 0,
+            stdout: stdout ?? '',
+            stderr: stderr ?? ''
+        });
+    });
+});
+
+const readText = (file) => readFile(file, 'utf8').catch(() => null);
+
+const formatDuration = (seconds) =>
+{
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+
+    if (days > 0)
+    {
+        return `${days}d ${hours}h`;
+    }
+
+    return hours > 0
+        ? `${hours}h ${minutes}m`
+        : `${minutes}m`;
+};
+
+const probeTcp = (port, host = '127.0.0.1') => new Promise((resolve) =>
+{
+    const started = Date.now();
+    const socket = new net.Socket();
+    let settled = false;
+
+    const finish = (ok) =>
+    {
+        if (settled)
+        {
+            return;
+        }
+
+        settled = true;
+        socket.destroy();
+        resolve({
+            ok,
+            ms: Date.now() - started
+        });
+    };
+
+    socket.setTimeout(PROBE_TIMEOUT_MS);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+    socket.connect(port, host);
+});
+
+const probeHttp = async (url, {
+    expect = null,
+    accept = null,
+    headers = {},
+    redirect = 'follow'
+} = {}) =>
+{
+    const started = Date.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+
+    try
+    {
+        const response = await fetch(url, {
+            signal:  controller.signal,
+            redirect,
+            headers: { 'user-agent': 'relaxy-health/1', ...headers }
+        });
+
+        const statusOk = accept
+            ? accept.includes(response.status)
+            : response.status < 500;
+
+        if (!statusOk)
+        {
+            return {
+                ok:     false,
+                ms:     Date.now() - started,
+                detail: `HTTP ${response.status}`
+            };
+        }
+
+        if (expect)
+        {
+            const body = await response.text();
+
+            if (!body.includes(expect))
+            {
+                return {
+                    ok:     false,
+                    ms:     Date.now() - started,
+                    detail: 'unexpected body'
+                };
+            }
+        }
+
+        return {
+            ok:     true,
+            ms:     Date.now() - started,
+            detail: `HTTP ${response.status}`
+        };
+    }
+    catch (error)
+    {
+        return {
+            ok:     false,
+            ms:     Date.now() - started,
+            detail: error.name === 'AbortError'
+                        ? 'timeout'
+                        : error.message
+        };
+    }
+    finally
+    {
+        clearTimeout(timer);
+    }
+};
+
+const probeDns = async (server, port, name = 'relaxy.xyz') =>
+{
+    const started = Date.now();
+    const resolver = new dns.Resolver({
+        timeout: PROBE_TIMEOUT_MS,
+        tries:   1
+    });
+
+    resolver.setServers([
+        port === 53
+            ? server
+            : `${server}:${port}`
+    ]);
+
+    try
+    {
+        const addresses = await new Promise((resolve, reject) =>
+        {
+            resolver.resolve4(name,
+                (error, result) => (error
+                    ? reject(error)
+                    : resolve(result)));
+        });
+
+        const ms = Date.now() - started;
+
+        return {
+            ok:     Array.isArray(addresses) && addresses.length > 0,
+            ms,
+            detail: `answered in ${ms}ms`
+        };
+    }
+    catch (error)
+    {
+        const ms = Date.now() - started;
+
+        if (error.code === 'ENODATA' || error.code === 'ENOTFOUND')
+        {
+            return {
+                ok:     true,
+                ms,
+                detail: `answered (${error.code}) in ${ms}ms`
+            };
+        }
+
+        return {
+            ok:     false,
+            ms,
+            detail: error.code ?? 'query failed'
+        };
+    }
+};
+
+const readRunit = async (names) =>
+{
+
+    const result = await run('/usr/bin/sudo', [
+        '-n',
+        '/usr/bin/sv',
+        'status',
+        ...names
+    ]);
+    const text = `${result.stdout}${result.stderr}`.trim();
+
+    if (!result.ok && /a password is required|not allowed/i.test(text))
+    {
+        return Object.fromEntries(names.map((name) => [
+            name,
+            null
+        ]));
+    }
+
+    const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
+    const entries = names.map((name) =>
+    {
+        const line = lines.find((candidate) => new RegExp(`^\\w+:\\s*${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:`).test(candidate));
+
+        if (!line)
+        {
+            return [
+                name,
+                null
+            ];
+        }
+
+        const match = line.match(/^(\w+):\s*\S+:\s*(?:\(pid (\d+)\)\s*)?(\d+)s/);
+
+        return [
+            name,
+            {
+                state:      match?.[1] ?? (line.split(':')[0] || 'unknown'),
+                pid:        match?.[2]
+                                ? Number(match[2])
+                                : null,
+                forSeconds: match?.[3]
+                                ? Number(match[3])
+                                : null,
+                raw:        line
+            }
+        ];
+    });
+
+    return Object.fromEntries(entries);
+};
+
+const readPodman = async () =>
+{
+    const result = await run('/usr/bin/podman', [
+        'ps',
+        '--all',
+        '--format',
+        'json'
+    ], 8000);
+
+    if (!result.ok)
+    {
+        return {};
+    }
+
+    try
+    {
+        const rows = JSON.parse(result.stdout);
+        const entries = rows.map((row) =>
+        {
+            const name = Array.isArray(row.Names)
+                ? row.Names[0]
+                : row.Names;
+
+            return [
+                name,
+                {
+                    state:        row.State,
+                    status:       row.Status,
+                    image:        row.Image,
+                    startedAt:    row.StartedAt ?? null,
+                    exitCode:     row.ExitCode ?? null,
+                    restartCount: row.RestartCount ?? 0
+                }
+            ];
+        });
+
+        return Object.fromEntries(entries);
+    }
+    catch
+    {
+        return {};
+    }
+};
+
+const readTmux = async () =>
+{
+    const result = await run('/usr/bin/tmux', [
+        'list-sessions',
+        '-F',
+        '#{session_name}'
+    ]);
+
+    return result.ok
+        ? new Set(result.stdout.split('\n').map((line) => line.trim()).filter(Boolean))
+        : new Set();
+};
+
+const SERVICES = [
+
+    {
+        key:      'website',
+        name:     'Website',
+        category: 'Web',
+        public:   true,
+        runit:    'caddy',
+
+        probe: () => probeHttp('http://127.0.0.1/', {
+            accept:   [
+                200,
+                301,
+                302,
+                308
+            ],
+            headers:  { host: 'relaxy.xyz' },
+            redirect: 'manual'
+        })
+    },
+    {
+
+        key:      'cdn',
+        name:     'The CDN',
+        category: 'Web',
+        public:   true,
+        runit:    'caddy',
+        probe:    () => probeHttp('http://127.0.0.1/', {
+            accept:   [
+                200,
+                301,
+                302,
+                308
+            ],
+            headers:  { host: 'cdn.relaxy.xyz' },
+            redirect: 'manual'
+        })
+    },
+    {
+        key:       'matrix',
+        name:      'Matrix (Continuwuity)',
+        category:  'Chat',
+        public:    true,
+        container: 'conduit',
+        probe:     () => probeHttp('http://127.0.0.1:13909/_matrix/client/versions', { expect: 'versions' })
+    },
+    {
+        key:       'matrixApi',
+        name:      'Matrix registration API',
+        category:  'Chat',
+        public:    true,
+        container: 'matrix-api',
+        probe:     () => probeTcp(8082)
+    },
+    {
+        key:       'irc',
+        name:      'IRC (ngIRCd)',
+        category:  'Chat',
+        public:    true,
+        container: 'ngircd',
+        probe:     () => probeTcp(57843)
+    },
+    {
+
+        key:       'dashboard',
+        name:      'Relaxy! Dashboard',
+        category:  'Bot',
+        public:    true,
+        container: 'dashboard',
+        probe:     () => probeHttp('http://127.0.0.1:8081/', {
+            accept: [
+                200,
+                301,
+                302,
+                401,
+                403,
+                404
+            ]
+        })
+    },
+    {
+        key:       'minecraft',
+        name:      'Minecraft server',
+        category:  'Games',
+        public:    true,
+        tmux:      'minecraft',
+        container: 'minecraft',
+        probe:     () => probeTcp(25565)
+    },
+    {
+        key:      'bot',
+        name:     'Relaxy! bot',
+        category: 'Bot',
+        public:   true,
+        tmux:     'relaxy',
+
+        remote:    true,
+        causeHint: 'bot-offline',
+        probe:     async ({ status }) =>
+                   {
+                       const blind = fleetBlind(status);
+
+                       if (blind)
+                       {
+                           return blind;
+                       }
+
+                       const bot = status.data.bot;
+
+                       if (!bot)
+                       {
+                           return {
+                               ok:     null,
+                               detail: 'fleet unreachable'
+                           };
+                       }
+
+                       const {
+                           ms,
+                           at
+                       } = fleetLatency(bot.latencyMs, bot.measuredAt);
+
+                       return {
+                           ok: Boolean(bot.online),
+
+                           ms,
+                           at,
+                           detail: bot.online
+                                       ? `primary: ${bot.primary}${ms != null
+                                   ? `, ${ms}ms gateway`
+                                   : ''}`
+                                       : 'no live hosts',
+                           meta:   managerMeta(bot)
+                       };
+                   }
+    },
+    {
+
+        key:       'database',
+        name:      'Database',
+        category:  'Bot',
+        public:    true,
+        remote:    true,
+        causeHint: 'database-unreachable',
+        probe:     async ({ status }) =>
+                   {
+                       const blind = fleetBlind(status);
+
+                       if (blind)
+                       {
+                           return blind;
+                       }
+
+                       const database = status.data.database;
+
+                       if (!database)
+                       {
+
+                           return {
+                               ok:     null,
+                               detail: 'not reported'
+                           };
+                       }
+
+                       return {
+                           ok: Boolean(database.online),
+
+                           ms:     Number.isFinite(database.latencyMs)
+                                       ? database.latencyMs
+                                       : null,
+                           at:     Date.parse(status.data.generatedAt) || null,
+                           detail: database.online
+                                       ? `answered in ${database.latencyMs}ms`
+                                       : `not answering (${database.reason ?? 'error'})`
+                       };
+                   }
+    },
+
+    {
+        key:      'sshd',
+        name:     'SSH',
+        category: 'Core',
+        critical: true,
+        runit:    'sshd',
+        probe:    () => probeTcp(SSH_PORT, '0.0.0.0')
+    },
+    {
+        key:       'adguard',
+        name:      'AdGuard DNS',
+        category:  'Network',
+        critical:  true,
+        container: 'adguard',
+        probe:     () => probeDns('127.0.0.1', 53)
+    },
+    {
+        key:      'unbound',
+        name:     'Unbound (upstream resolver)',
+        category: 'Network',
+        critical: true,
+        runit:    'unbound',
+        probe:    () => probeDns('127.0.0.1', 5335)
+    },
+    {
+        key:      'caddy',
+        name:     'Caddy',
+        category: 'Web',
+        critical: true,
+        runit:    'caddy',
+        probe:    () => probeTcp(443, '127.0.0.1')
+    },
+    {
+        key:      'tor',
+        name:     'Tor',
+        category: 'Network',
+        runit:    'tor',
+        probe:    () => probeTcp(9050)
+    },
+    {
+        key:      'nftables',
+        name:     'Firewall (nftables)',
+        category: 'Core',
+        runit:    'nftables'
+    },
+    {
+        key:      'fail2ban',
+        name:     'fail2ban',
+        category: 'Core',
+        runit:    'fail2ban'
+    },
+    {
+        key:      'cronie',
+        name:     'cron',
+        category: 'Core',
+        runit:    'cronie'
+    },
+    {
+        key:      'ntpd',
+        name:     'NTP',
+        category: 'Core',
+        runit:    'ntpd'
+    },
+    {
+        key:      'statusWriter',
+        name:     'Status publisher',
+        category: 'Apps',
+        runit:    'status-writer',
+        probe:    async () =>
+                  {
+                      const raw = await readText(STATUS_FILE);
+
+                      if (!raw)
+                      {
+                          return {
+                              ok:     false,
+                              detail: 'missing'
+                          };
+                      }
+
+                      try
+                      {
+                          const age = Date.now() - Date.parse(JSON.parse(raw).generatedAt);
+
+                          return {
+                              ok:     age < STATUS_STALE_MS,
+                              detail: `${Math.round(age / 1000)}s old`
+                          };
+                      }
+                      catch
+                      {
+                          return {
+                              ok:     false,
+                              detail: 'unparseable'
+                          };
+                      }
+                  }
+    },
+    {
+        key:      'sshstatus',
+        name:     'SSH status page',
+        category: 'Apps',
+        runit:    'sshstatus',
+        probe:    () => probeTcp(12764)
+    },
+    {
+        key:      'goaccess',
+        name:     'GoAccess (stats)',
+        category: 'Apps',
+        probe:    () => probeTcp(7890)
+    },
+    {
+        key:      'zram',
+        name:     'zram swap',
+        category: 'Core',
+        runit:    'zram-swap',
+        probe:    async () =>
+                  {
+
+                      const raw = await readText('/proc/swaps');
+
+                      if (!raw)
+                      {
+                          return {
+                              ok:     false,
+                              detail: 'cannot read /proc/swaps'
+                          };
+                      }
+
+                      const line = raw.split('\n').find((row) => row.startsWith('/dev/zram'));
+
+                      if (!line)
+                      {
+                          return {
+                              ok:     false,
+                              detail: 'no zram swap active'
+                          };
+                      }
+
+                      const [, , sizeKb, usedKb] = line.split(/\s+/);
+
+                      return {
+                          ok:     true,
+                          detail: `${round(Number(sizeKb) / 1048576, 1)} GB, ${round(Number(usedKb) / 1048576, 2)} GB used`
+                      };
+                  }
+    },
+    {
+        key:      'watchdog',
+        name:     'Hardware watchdog',
+        category: 'Core',
+        critical: true,
+        runit:    'relaxy-watchdog',
+        probe:    async () =>
+                  {
+                      const raw = await readText(WATCHDOG_FILE);
+
+                      if (!raw)
+                      {
+                          return {
+                              ok:     false,
+                              detail: 'not reporting'
+                          };
+                      }
+
+                      try
+                      {
+                          const data = JSON.parse(raw);
+                          const age = Date.now() - Date.parse(data.lastPet);
+
+                          return {
+                              ok:     age < 30000,
+                              detail: age < 30000
+                                          ? (data.armed
+                                      ? 'armed'
+                                      : 'observing')
+                                          : `stale (${Math.round(age / 1000)}s)`
+                          };
+                      }
+                      catch
+                      {
+                          return {
+                              ok:     false,
+                              detail: 'unparseable'
+                          };
+                      }
+                  }
+    }
+];
+
+const cpuSnapshot = async () =>
+{
+    const stat = await readText('/proc/stat');
+
+    if (!stat)
+    {
+        return null;
+    }
+
+    const cpus = stat.split('\n')
+                     .filter((line) => /^cpu\d*\s/.test(line))
+                     .map((line) =>
+                     {
+                         const [, ...fields] = line.trim().split(/\s+/);
+                         const [user, nice, system, idle, iowait, irq, softirq, steal] = fields.map(Number);
+
+                         return {
+                             idle:  idle + iowait,
+                             total: user + nice + system + idle + iowait + irq + softirq + steal
+                         };
+                     });
+
+    const procs = stat.match(/^procs_running (\d+)/m)?.[1];
+
+    return {
+        cpus,
+        running: procs
+                     ? Number(procs)
+                     : null
+    };
+};
+
+const busyBetween = (before, after) =>
+{
+    if (!before || !after)
+    {
+        return null;
+    }
+
+    const total = after.total - before.total;
+
+    if (total <= 0)
+    {
+        return null;
+    }
+
+    return Math.round((100 * (total - (after.idle - before.idle))) / total);
+};
+
+const netSnapshot = async () =>
+{
+    const raw = await readText('/proc/net/dev');
+
+    if (!raw)
+    {
+        return {};
+    }
+
+    const entries = raw.split('\n').slice(2)
+                       .map((line) => line.trim())
+                       .filter(Boolean)
+                       .map((line) =>
+                       {
+                           const [name, rest] = line.split(':');
+                           const fields = rest.trim().split(/\s+/).map(Number);
+
+                           return [
+                               name.trim(),
+                               {
+                                   rx: fields[0],
+                                   tx: fields[8]
+                               }
+                           ];
+                       })
+                       .filter(([name]) => name !== 'lo');
+
+    return Object.fromEntries(entries);
+};
+
+const readProcesses = async (previous, elapsedSeconds) =>
+{
+    const { readdir } = require('node:fs/promises');
+    const pids = (await readdir('/proc').catch(() => []))
+        .filter((entry) => /^\d+$/.test(entry));
+
+    const current = new Map();
+    const rows = [];
+
+    const CHUNK = 40;
+
+    const readOne = async (pid) =>
+    {
+        const stat = await readText(`/proc/${pid}/stat`);
+
+        if (!stat)
+        {
+            return;
+        }
+
+        const close = stat.lastIndexOf(')');
+        const name = stat.slice(stat.indexOf('(') + 1, close);
+        const fields = stat.slice(close + 2).split(' ');
+
+        const utime = Number(fields[11]);
+        const stime = Number(fields[12]);
+        const rssPages = Number(fields[21]);
+        const jiffies = utime + stime;
+
+        current.set(pid, jiffies);
+
+        const before = previous?.get(pid);
+        const cpuPercent = before != null && elapsedSeconds > 0
+            ? round((100 * (jiffies - before)) / (CLK_TCK * elapsedSeconds), 1)
+            : null;
+
+        rows.push({
+            pid:   Number(pid),
+            name,
+            cpuPercent,
+            memMb: round((rssPages * 4096) / 1048576, 1)
+        });
+    };
+
+    for (let index = 0; index < pids.length; index += CHUNK)
+    {
+        await Promise.all(pids.slice(index, index + CHUNK).map(readOne));
+
+        await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    rows.sort((a, b) => (b.cpuPercent ?? -1) - (a.cpuPercent ?? -1) || b.memMb - a.memMb);
+
+    return {
+        snapshot: current,
+        top:      rows.slice(0, 15),
+        total:    rows.length
+    };
+};
+
+const readDisks = async () =>
+{
+    const result = await run('/usr/bin/df', [
+        '-B1',
+        '--output=target,size,used,pcent',
+        '/',
+        '/boot'
+    ]);
+
+    if (!result.ok)
+    {
+        return [];
+    }
+
+    return result.stdout.split('\n').slice(1)
+                 .map((line) => line.trim().split(/\s+/))
+                 .filter((fields) => fields.length >= 4)
+                 .map(([mount, size, used, percent]) => ({
+                     mount,
+                     sizeGb:  round(Number(size) / 1024 ** 3, 1),
+                     usedGb:  round(Number(used) / 1024 ** 3, 1),
+                     percent: Number(String(percent).replace('%', ''))
+                 }));
+};
+
+const readTemperature = async () =>
+{
+    const raw = await readText('/sys/class/thermal/thermal_zone0/temp');
+    const value = Number(raw?.trim());
+
+    return Number.isFinite(value) && value > 0
+        ? round(value > 1000
+            ? value / 1000
+            : value, 1)
+        : null;
+};
+
+const readUndervoltage = async () =>
+{
+    const { readdir } = require('node:fs/promises');
+    const hwmons = await readdir('/sys/class/hwmon').catch(() => []);
+
+    for (const entry of hwmons)
+    {
+        const name = (await readText(`/sys/class/hwmon/${entry}/name`))?.trim();
+
+        if (name !== 'rpi_volt')
+        {
+            continue;
+        }
+
+        const alarm = (await readText(`/sys/class/hwmon/${entry}/in0_lcrit_alarm`))?.trim();
+
+        if (alarm == null)
+        {
+            return null;
+        }
+
+        return { detected: alarm === '1' };
+    }
+
+    return null;
+};
+
+const readCpuFreq = async () =>
+{
+    const [current, min, max, governor] = await Promise.all([
+        readText('/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq'),
+        readText('/sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq'),
+        readText('/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq'),
+        readText('/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor')
+    ]);
+
+    const mhz = (value) => (value
+        ? Math.round(Number(value.trim()) / 1000)
+        : null);
+
+    return {
+        currentMhz: mhz(current),
+        minMhz:     mhz(min),
+        maxMhz:     mhz(max),
+        governor:   governor?.trim() ?? null
+    };
+};
+
+const readMemory = async () =>
+{
+    const raw = await readText('/proc/meminfo') ?? '';
+    const kb = (key) => Number(raw.match(new RegExp(`^${key}:\\s+(\\d+)`, 'm'))?.[1]);
+    const gb = (value) => round(value / 1048576, 2);
+
+    const total = kb('MemTotal') || 0;
+    const available = kb('MemAvailable') ?? 0;
+    const swapTotal = kb('SwapTotal') || 0;
+    const swapFree = kb('SwapFree') || 0;
+
+    return {
+        memory: {
+            totalGb:     gb(total),
+            usedGb:      gb(total - available),
+            availableGb: gb(available),
+            buffCacheGb: gb((kb('Buffers') || 0) + (kb('Cached') || 0)),
+            percent:     total
+                             ? Math.round((100 * (total - available)) / total)
+                             : null
+        },
+        swap:   {
+            totalGb: gb(swapTotal),
+            usedGb:  gb(swapTotal - swapFree),
+            percent: swapTotal
+                         ? Math.round((100 * (swapTotal - swapFree)) / swapTotal)
+                         : null
+        }
+    };
+};
+
+const readModel = async () =>
+{
+    const raw = await readText('/proc/device-tree/model');
+
+    return raw
+        ? raw.replace(/\0/g, '').trim()
+        : null;
+};
+
+const readOsName = async () =>
+{
+    const raw = await readText('/etc/os-release');
+
+    return raw?.match(/^PRETTY_NAME="?([^"\n]+)"?/m)?.[1] ?? `${os.type()} ${os.release()}`;
+};
+
+const loadState = async () =>
+{
+    const raw = await readText(STATE_FILE);
+
+    try
+    {
+        return raw
+            ? JSON.parse(raw)
+            : {};
+    }
+    catch
+    {
+        return {};
+    }
+};
+
+const writeJson = async (file, payload, mode = 0o644) =>
+{
+    const temporary = `${file}.tmp`;
+
+    await mkdir(path.dirname(file), { recursive: true }).catch(() => {});
+    await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, {
+        encoding: 'utf8',
+        mode
+    });
+    await rename(temporary, file);
+};
+
+const main = async () =>
+{
+    let state = await loadState();
+
+    const ledger = createLedger({
+        stateFile:  UPTIME_STATE_FILE,
+        notesFile:  UPTIME_NOTES_FILE,
+        publicFile: UPTIME_PUBLIC_FILE
+    });
+
+    await ledger.load().catch((error) =>
+    {
+        console.error(`[relaxy-health] uptime ledger failed to load: ${error.message}`);
+    });
+
+    const announcer = createAnnouncer({ statusFile: STATUS_FILE });
+
+    let previousCpu = await cpuSnapshot();
+    let previousNet = await netSnapshot();
+    let previousProcs = null;
+    let previousAt = Date.now();
+    let previousHeavyAt = null;
+    let tickCount = 0;
+
+    const model = await readModel();
+    const osName = await readOsName();
+
+    let heavy = {
+        procs:      {
+            snapshot: null,
+            top:      [],
+            total:    0
+        },
+        containers: {},
+        tmux:       new Set(),
+        disks:      []
+    };
+
+    const tick = async () =>
+    {
+        const now = Date.now();
+        const elapsedSeconds = Math.max(1, (now - previousAt) / 1000);
+
+        tickCount += 1;
+
+        const status = await readFleetStatus(now);
+
+        const runitNames = [...new Set(SERVICES.map((service) => service.runit).filter(Boolean))];
+
+        const [
+            currentCpu, currentNet, runit, temperature, freq, memory, undervoltage
+        ] = await Promise.all([
+            cpuSnapshot(),
+            netSnapshot(),
+            readRunit(runitNames),
+            readTemperature(),
+            readCpuFreq(),
+            readMemory(),
+            readUndervoltage()
+        ]);
+
+        const {
+            procs,
+            containers,
+            tmux,
+            disks
+        } = heavy;
+
+        const services = await Promise.all(SERVICES.map(async (service) =>
+        {
+            const runitState = service.runit
+                ? runit[service.runit] ?? null
+                : null;
+            const container = service.container
+                ? containers[service.container] ?? null
+                : null;
+            const inTmux = service.tmux
+                ? tmux.has(service.tmux)
+                : null;
+
+            let online = null;
+            let detail = null;
+            let latencyMs = null;
+            let latencyAt = null;
+            let meta = null;
+
+            if (service.probe)
+            {
+                const result = await service.probe({
+                                                now,
+                                                status
+                                            })
+                                            .catch(() => ({
+                                                ok:     false,
+                                                detail: 'probe threw'
+                                            }));
+
+                online = result.ok;
+                detail = result.detail ?? null;
+                latencyMs = result.ms ?? null;
+
+                latencyAt = result.at ?? null;
+                meta = result.meta ?? null;
+            }
+            else if (runitState)
+            {
+
+                online = runitState.state === 'run';
+
+                const machineUptime = os.uptime();
+                const age = runitState.forSeconds;
+
+                detail = age != null && age <= machineUptime
+                    ? `${runitState.state} for ${formatDuration(age)}`
+                    : runitState.state === 'run'
+                        ? 'running since boot'
+                        : runitState.state;
+            }
+            else if (container)
+            {
+                online = container.state === 'running';
+                detail = container.status;
+            }
+
+            const previousEntry = state[service.key];
+            const changed = !previousEntry || previousEntry.online !== online;
+
+            return {
+                key:      service.key,
+                name:     service.name,
+                category: service.category,
+                critical: Boolean(service.critical),
+                public:   Boolean(service.public),
+
+                remote:     Boolean(service.remote),
+                causeHint:  service.causeHint ?? null,
+                online,
+                detail,
+                latencyMs,
+                latencyAt,
+                meta,
+                since:      changed
+                                ? new Date(now).toISOString()
+                                : previousEntry.since,
+                supervisor: runitState
+                                ? { kind: 'runit', ...runitState }
+                                : container
+                        ? { kind: 'podman', ...container }
+                        : inTmux != null
+                            ? {
+                                kind:  'tmux',
+                                state: inTmux
+                                           ? 'run'
+                                           : 'down'
+                            }
+                            : null
+            };
+        }));
+
+        state = Object.fromEntries(services.map((service) => [
+            service.key,
+            {
+                online: service.online,
+                since:  service.since
+            }
+        ]));
+
+        const perCore = currentCpu?.cpus.slice(1).map((core, index) => busyBetween(previousCpu?.cpus[index + 1], core)) ?? [];
+
+        const network = Object.entries(currentNet).map(([iface, counters]) => ({
+            iface,
+            rxBytes: counters.rx,
+            txBytes: counters.tx,
+            rxKbps:  previousNet[iface]
+                         ? round(((counters.rx - previousNet[iface].rx) * 8) / 1000 / elapsedSeconds, 1)
+                         : null,
+            txKbps:  previousNet[iface]
+                         ? round(((counters.tx - previousNet[iface].tx) * 8) / 1000 / elapsedSeconds, 1)
+                         : null
+        }));
+
+        const watchdogRaw = await readText(WATCHDOG_FILE);
+        let watchdog = null;
+
+        try
+        {
+            watchdog = watchdogRaw
+                ? JSON.parse(watchdogRaw)
+                : null;
+        }
+        catch
+        {
+            watchdog = null;
+        }
+
+        const counted = services.filter((service) => service.online !== null);
+
+        const payload = {
+            generatedAt: new Date(now).toISOString(),
+            summary:     {
+                total:           services.length,
+                online:          counted.filter((service) => service.online).length,
+                offline:         counted.filter((service) => !service.online).length,
+                unknown:         services.length - counted.length,
+                criticalOffline: services
+                                     .filter((service) => service.critical && service.online === false)
+                                     .map((service) => service.key)
+            },
+            system:      {
+                host:          os.hostname(),
+                model,
+                os:            osName,
+                kernel:        os.release(),
+                arch:          typeof os.machine === 'function'
+                                   ? os.machine()
+                                   : os.arch(),
+                uptimeSeconds: Math.floor(os.uptime()),
+                loadAverage:   os.loadavg().map((value) => round(value, 2)),
+                temperatureC:  temperature,
+                undervoltage,
+                cpu:           {
+                    cores:            os.cpus().length,
+                    busyPercent:      busyBetween(previousCpu?.cpus[0], currentCpu?.cpus[0]),
+                    perCorePercent:   perCore,
+                    runningProcesses: currentCpu?.running ?? null, ...freq
+                }, ...memory,
+                disks,
+                network,
+                processes:     {
+                    total: procs.total,
+                    top:   procs.top
+                }
+            },
+            services,
+            watchdog
+        };
+
+        await writeJson(FULL_OUTPUT, payload);
+
+        const publicServices = services
+            .filter((service) => service.public)
+            .map((service) => ({
+                key:       service.key,
+                name:      service.name,
+                category:  service.category,
+                online:    service.online,
+                since:     service.since,
+                latencyMs: service.latencyMs,
+                latencyAt: service.latencyAt,
+
+                meta: service.meta
+            }));
+
+        await writeJson(PUBLIC_OUTPUT, {
+            generatedAt: payload.generatedAt,
+            services:    publicServices
+        });
+
+        await writeJson(STATE_FILE, state).catch(() => {});
+
+        try
+        {
+            ledger.record({
+                now,
+                services,
+                system: payload.system,
+                watchdog
+            });
+
+            const incidentChanged = ledger.hasPendingIncidentChange();
+
+            const every = ledger.hasOngoing()
+                ? UPTIME_PUBLISH_EVERY_ACTIVE
+                : UPTIME_PUBLISH_EVERY;
+
+            if (incidentChanged || tickCount % every === 0)
+            {
+                const published = await ledger.publish({
+                    now,
+                    publicServices
+                });
+
+                await ledger.flush({ force: incidentChanged });
+
+                await announcer.sync(published, now);
+            }
+        }
+        catch (error)
+        {
+            console.error(`[relaxy-health] uptime ledger failed: ${error.message}`);
+        }
+
+        previousCpu = currentCpu ?? previousCpu;
+        previousNet = Object.keys(currentNet).length
+            ? currentNet
+            : previousNet;
+
+        previousAt = now;
+    };
+
+    const collectors = {
+        containers: async () => { heavy.containers = await readPodman(); },
+        tmux:       async () => { heavy.tmux = await readTmux(); },
+        disks:      async () => { heavy.disks = await readDisks(); },
+        procs:      async () =>
+                    {
+                        const now = Date.now();
+                        const elapsed = previousHeavyAt
+                            ? (now - previousHeavyAt) / 1000
+                            : 60;
+                        const procs = await readProcesses(previousProcs, elapsed);
+
+                        heavy.procs = procs;
+                        previousProcs = procs.snapshot;
+                        previousHeavyAt = now;
+                    }
+    };
+
+    COLLECTORS.forEach(({
+        key,
+        intervalMs,
+        offsetMs
+    }, index) =>
+    {
+        const runCollector = () => collectors[key]().catch((error) =>
+        {
+            console.error(`[relaxy-health] collector ${key} failed: ${error.message}`);
+        });
+
+        setTimeout(runCollector, (index + 1) * 2000);
+
+        setTimeout(() => setInterval(runCollector, intervalMs), offsetMs);
+    });
+
+    const history = [];
+    let vitalsPrevCpu = previousCpu;
+    let vitalsPrevNet = previousNet;
+    let vitalsPrevAt = Date.now();
+
+    const vitalsTick = async () =>
+    {
+        const now = Date.now();
+        const seconds = Math.max(0.5, (now - vitalsPrevAt) / 1000);
+
+        const [currentCpu, currentNet, temperature, memory, freq] = await Promise.all([
+            cpuSnapshot(),
+            netSnapshot(),
+            readTemperature(),
+            readMemory(),
+            readCpuFreq()
+        ]);
+
+        let rxKbps = null;
+        let txKbps = null;
+
+        const primary = Object.entries(currentNet)
+                              .filter(([iface]) => iface !== 'lo')
+                              .sort((a, b) => (b[1].rx + b[1].tx) - (a[1].rx + a[1].tx))[0];
+
+        if (primary)
+        {
+            const [iface, counters] = primary;
+            const before = vitalsPrevNet[iface];
+
+            if (before)
+            {
+
+                rxKbps = round(Math.max(0, (counters.rx - before.rx) * 8) / 1000 / seconds, 1);
+                txKbps = round(Math.max(0, (counters.tx - before.tx) * 8) / 1000 / seconds, 1);
+            }
+        }
+
+        const sample = {
+            t:     now,
+            cpu:   busyBetween(vitalsPrevCpu?.cpus[0], currentCpu?.cpus[0]),
+            cores: currentCpu?.cpus.slice(1).map((core, index) => busyBetween(vitalsPrevCpu?.cpus[index + 1], core)) ?? [],
+            mem:   memory.memory.percent,
+            temp:  temperature,
+            load:  round(os.loadavg()[0], 2),
+            rxKbps,
+            txKbps,
+            mhz:   freq.currentMhz
+        };
+
+        history.push(sample);
+
+        while (history.length > VITALS_HISTORY)
+        {
+            history.shift();
+        }
+
+        vitalsPrevCpu = currentCpu ?? vitalsPrevCpu;
+        vitalsPrevNet = Object.keys(currentNet).length
+            ? currentNet
+            : vitalsPrevNet;
+        vitalsPrevAt = now;
+
+        await writeJson(VITALS_OUTPUT, {
+            generatedAt: new Date(now).toISOString(),
+            intervalMs:  VITALS_INTERVAL_MS,
+            current:     sample,
+            history
+        }).catch(() => {});
+    };
+
+    await tick();
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await tick();
+    await vitalsTick();
+
+    console.log(`[relaxy-health] publishing ${FULL_OUTPUT} every ${INTERVAL_MS}ms`);
+
+    const loop = async () =>
+    {
+        try
+        {
+            await tick();
+        }
+        catch (error)
+        {
+            console.error(`[relaxy-health] tick failed: ${error.stack ?? error}`);
+        }
+    };
+
+    setInterval(loop, INTERVAL_MS);
+
+    setInterval(() =>
+    {
+        vitalsTick().catch((error) =>
+        {
+            console.error(`[relaxy-health] vitals tick failed: ${error.stack ?? error}`);
+        });
+    }, VITALS_INTERVAL_MS);
+
+    for (const signal of [
+        'SIGINT',
+        'SIGTERM'
+    ])
+    {
+        process.on(signal, () =>
+        {
+            console.log(`[relaxy-health] ${signal} - stopping.`);
+
+            setTimeout(() => process.exit(0), 2000).unref();
+
+            ledger.flush({ force: true })
+                  .catch(() => {})
+                  .finally(() => process.exit(0));
+        });
+    }
+};
+
+main().catch((error) =>
+{
+    console.error(`[relaxy-health] fatal: ${error.stack ?? error}`);
+    process.exit(1);
+});

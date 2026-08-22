@@ -1,0 +1,31 @@
+#!/bin/sh
+exec 2>&1
+
+CONFIG_FILE=/etc/relaxy-watchdog.conf
+[ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+export HOME=/home/mattfor
+export XDG_CONFIG_HOME=/home/mattfor/.config
+
+export XDG_RUNTIME_DIR="${PODMAN_RUNTIME_DIR:-/tmp/podman-run-start}"
+
+for name in OUTAGE_ANNOUNCE OUTAGE_DISCORD_WEBHOOK OUTAGE_DISCORD_TOKEN \
+            OUTAGE_DISCORD_CHANNEL OUTAGE_TOKEN_FILE OUTAGE_SETTLE_MS \
+            OUTAGE_MAX_BACKFILL_MS OUTAGE_CROSSPOST OUTAGE_CROSSPOST_UPDATES \
+            OUTAGE_PUBLISH_WINDOW_MS OUTAGE_FOOTER UPTIME_PAGE_URL \
+            UPTIME_REPEAT_WITHIN_MS UPTIME_DEGRADE_SPAN_MS
+do
+    eval "value=\${$name:-}"
+    [ -n "$value" ] && export "$name"
+done
+
+NODE=$(ls -d /home/mattfor/.config/nvm/versions/node/*/bin/node 2>/dev/null | sort -V | tail -1)
+[ -x "$NODE" ] || NODE=$(command -v node)
+
+if [ ! -x "$NODE" ]; then
+    echo "relaxy-health: no node interpreter found" >&2
+    sleep 10
+    exit 1
+fi
+
+exec nice -n 19 ionice -c 3 chpst -u mattfor:mattfor "$NODE" /home/mattfor/relaxy/additions/bin/relaxy-health
