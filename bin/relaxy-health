@@ -61,7 +61,9 @@ const VITALS_INTERVAL_MS = Number(process.env.HEALTH_VITALS_INTERVAL_MS ?? 5000)
 const VITALS_HISTORY = Number(process.env.HEALTH_VITALS_HISTORY ?? 180);
 const VITALS_OUTPUT = process.env.HEALTH_VITALS_OUTPUT ?? '/home/mattfor/stats/pi-vitals.json';
 const PROBE_TIMEOUT_MS = Number(process.env.HEALTH_PROBE_TIMEOUT_MS ?? 4000);
-const SSH_PORT = Number(process.env.SSH_PORT ?? 22);
+const WATCHDOG_CONFIG = process.env.WATCHDOG_CONFIG_FILE ?? '/etc/relaxy-watchdog.conf';
+const SSHD_CONFIG = process.env.SSHD_CONFIG_FILE ?? '/etc/ssh/sshd_config';
+const SSH_PORT_TTL_MS = 5 * 60 * 1000;
 
 const STATUS_STALE_MS = 90 * 1000;
 
@@ -218,6 +220,66 @@ const run = (command, args, timeout = PROBE_TIMEOUT_MS) => new Promise((resolve)
 });
 
 const readText = (file) => readFile(file, 'utf8').catch(() => null);
+
+let sshPortCache = {
+    port: null,
+    at:   0
+};
+
+const parseSshPort = (raw, pattern) =>
+{
+    if (!raw)
+    {
+        return null;
+    }
+
+    let found = null;
+
+    for (const line of raw.split('\n'))
+    {
+        const match = line.match(pattern);
+
+        if (match)
+        {
+            found = Number(match[1]);
+        }
+    }
+
+    return Number.isInteger(found) && found > 0 && found < 65536
+        ? found
+        : null;
+};
+
+const resolveSshPort = async (now = Date.now()) =>
+{
+    const fromEnv = Number(process.env.SSH_PORT);
+
+    if (Number.isInteger(fromEnv) && fromEnv > 0 && fromEnv < 65536)
+    {
+        return fromEnv;
+    }
+
+    if (sshPortCache.port && now - sshPortCache.at < SSH_PORT_TTL_MS)
+    {
+        return sshPortCache.port;
+    }
+
+    const [watchdogConf, sshdConf] = await Promise.all([
+        readText(WATCHDOG_CONFIG),
+        readText(SSHD_CONFIG)
+    ]);
+
+    const port = parseSshPort(watchdogConf, /^\s*SSH_PORT\s*=\s*["']?(\d+)["']?/)
+        ?? parseSshPort(sshdConf, /^\s*Port\s+(\d+)\s*$/i)
+        ?? 22;
+
+    sshPortCache = {
+        port,
+        at: now
+    };
+
+    return port;
+};
 
 const formatDuration = (seconds) =>
 {
@@ -677,7 +739,7 @@ const SERVICES = [
         category: 'Core',
         critical: true,
         runit:    'sshd',
-        probe:    () => probeTcp(SSH_PORT, '0.0.0.0')
+        probe:    async ({ now }) => probeTcp(await resolveSshPort(now), '0.0.0.0')
     },
     {
         key:       'adguard',
