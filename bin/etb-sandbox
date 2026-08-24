@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+#
+set -uo pipefail
+
+BOT_DIR="${ETB_BOT_DIR:-/home/mattfor/etb/etb-speedrun-bot-v2}"
+PYTHON="${BOT_DIR}/.venv/bin/python"
+
+die()  { printf 'etb-sandbox: ERROR: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'etb-sandbox: warning: %s\n' "$*" >&2; }
+
+command -v bwrap >/dev/null 2>&1 || die "bubblewrap (bwrap) is not installed"
+
+[ -d "$BOT_DIR" ] || die "${BOT_DIR} does not exist"
+[ -x "$PYTHON" ]  || die "${PYTHON} is missing or not executable - the venv is not built"
+
+[ -r "${BOT_DIR}/.env" ] || die "${BOT_DIR}/.env is missing - the bot would exit with 'no bot token'"
+
+BINDS=(
+    --ro-bind /usr  /usr
+    --ro-bind /lib  /lib
+    --ro-bind /bin  /bin
+    --ro-bind /sbin /sbin
+)
+
+if [ -d /lib64 ]; then
+    BINDS+=(--ro-bind /lib64 /lib64)
+fi
+
+for file in /etc/resolv.conf /etc/hosts /etc/nsswitch.conf; do
+    if [ -r "$file" ]; then
+        BINDS+=(--ro-bind "$file" "$file")
+    else
+        warn "${file} is missing - the bot may not be able to resolve any hostname"
+    fi
+done
+
+if [ -r /etc/passwd ]; then
+    BINDS+=(--ro-bind /etc/passwd /etc/passwd)
+fi
+
+if [ -d /etc/ssl ]; then
+    BINDS+=(--ro-bind /etc/ssl /etc/ssl)
+else
+    die "/etc/ssl is missing so the bot would fail certificate verification on every request"
+fi
+
+if [ -e /etc/localtime ]; then
+    BINDS+=(--ro-bind /etc/localtime /etc/localtime)
+fi
+
+exec bwrap \
+    "${BINDS[@]}" \
+    --ro-bind "$BOT_DIR" "$BOT_DIR" \
+    --proc /proc \
+    --dev /dev \
+    --tmpfs /tmp \
+    --dir /tmp/home \
+    --dir /tmp/pycache \
+    --clearenv \
+    --setenv PATH /usr/bin:/bin \
+    --setenv HOME /tmp/home \
+    --setenv TERM "${TERM:-dumb}" \
+    --setenv LANG "${LANG:-C.UTF-8}" \
+    --setenv PYTHONPYCACHEPREFIX /tmp/pycache \
+    --setenv PYTHONUNBUFFERED 1 \
+    --unshare-pid \
+    --unshare-ipc \
+    --unshare-uts \
+    --die-with-parent \
+    --chdir "$BOT_DIR" \
+    -- \
+    "$PYTHON" -m etb_bot

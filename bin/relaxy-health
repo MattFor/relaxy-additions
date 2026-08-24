@@ -4,6 +4,7 @@
 
 const {
     readFile,
+    readlink,
     writeFile,
     rename,
     mkdir
@@ -555,6 +556,73 @@ const readTmux = async () =>
         : new Set();
 };
 
+const ETB_ARGV = [
+    '-m',
+    'etb_bot'
+];
+
+let etbPidCache = null;
+
+const readCmdline = async (pid) =>
+{
+    const raw = await readText(`/proc/${pid}/cmdline`);
+
+    return raw
+        ? raw.split('\0').filter(Boolean)
+        : null;
+};
+
+const isEtbBot = (argv) => Array.isArray(argv)
+    && argv.length >= 3
+    && /(^|\/)python[\d.]*$/.test(argv[0])
+    && argv[1] === ETB_ARGV[0]
+    && argv[2] === ETB_ARGV[1];
+
+const findEtbBot = async () =>
+{
+    if (etbPidCache != null && isEtbBot(await readCmdline(etbPidCache)))
+    {
+        return etbPidCache;
+    }
+
+    etbPidCache = null;
+
+    const { readdir } = require('node:fs/promises');
+    const pids = (await readdir('/proc').catch(() => []))
+        .filter((entry) => /^\d+$/.test(entry));
+
+    const CHUNK = 40;
+
+    for (let index = 0; index < pids.length && etbPidCache == null; index += CHUNK)
+    {
+        const found = await Promise.all(pids.slice(index, index + CHUNK)
+                                            .map(async (pid) => (isEtbBot(await readCmdline(pid))
+                                                ? Number(pid)
+                                                : null)));
+
+        etbPidCache = found.find((pid) => pid != null) ?? null;
+
+        await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    return etbPidCache;
+};
+
+const isSandboxed = async (pid) =>
+{
+    const [
+        theirs,
+        ours
+    ] = await Promise.all([
+        readlink(`/proc/${pid}/ns/mnt`).catch(() => null),
+        readlink('/proc/self/ns/mnt').catch(() => null)
+    ]);
+
+    return theirs && ours
+        ? theirs !== ours
+        : null;
+};
+
 const SERVICES = [
 
     {
@@ -690,6 +758,44 @@ const SERVICES = [
                            meta:   managerMeta(bot)
                        };
                    }
+    },
+    {
+        key:      'etbBot',
+        name:     'ETB speedrun bot',
+        category: 'Bot',
+
+        public: false,
+        tmux:   'etb-bot',
+
+        probe: async ({ tmux }) =>
+               {
+                   const pid = await findEtbBot();
+
+                   if (pid != null)
+                   {
+                       const sandboxed = await isSandboxed(pid);
+
+                       return {
+                           ok:     true,
+                           detail: sandboxed === true
+                                       ? `running (pid ${pid}, sandboxed)`
+                                       : sandboxed === false
+                                           ? `running (pid ${pid}, OUTSIDE the sandbox)`
+                                           : `running (pid ${pid})`,
+                           meta:   {
+                               pid,
+                               sandboxed
+                           }
+                       };
+                   }
+
+                   return {
+                       ok:     false,
+                       detail: tmux.has('etb-bot')
+                                   ? 'session is up but the bot is not running'
+                                   : 'not running'
+                   };
+               }
     },
     {
 
@@ -1312,7 +1418,8 @@ const main = async () =>
             {
                 const result = await service.probe({
                                                 now,
-                                                status
+                                                status,
+                                                tmux
                                             })
                                             .catch(() => ({
                                                 ok:     false,

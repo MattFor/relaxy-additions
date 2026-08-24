@@ -27,7 +27,8 @@ for file in \
     "$SRC/sv/relaxy-health/run" "$SRC/sv/relaxy-watchdog/run" "$SRC/sv/ssh-priority/run" \
     "$SRC/etc/relaxy-watchdog.conf" "$SRC/etc/nftables-ssh-prio.nft" \
     "$SRC/etc/sudoers-relaxy-health" "$SRC/web/pi.html" "$SRC/web/stats-index.html" \
-    "$SRC/bin/incident" "$SRC/lib/uptime-history.js" "$SRC/lib/discord-outages.js"
+    "$SRC/bin/incident" "$SRC/lib/uptime-history.js" "$SRC/lib/discord-outages.js" \
+    "$SRC/bin/etb-sandbox"
 do
     [ -r "$file" ] || die "missing source file: $file"
 done
@@ -35,6 +36,7 @@ ok "all source files present"
 
 bash -n "$SRC/bin/relaxy-watchdog" || die "relaxy-watchdog has a syntax error"
 bash -n "$SRC/bin/ssh-priority"    || die "ssh-priority has a syntax error"
+bash -n "$SRC/bin/etb-sandbox"     || die "etb-sandbox has a syntax error"
 sh   -n "$SRC/sv/relaxy-health/run"    || die "relaxy-health run script has a syntax error"
 sh   -n "$SRC/sv/relaxy-watchdog/run"  || die "relaxy-watchdog run script has a syntax error"
 sh   -n "$SRC/sv/ssh-priority/run"     || die "ssh-priority run script has a syntax error"
@@ -94,10 +96,16 @@ say "Installing binaries"
 
 install -d -m 0755 /home/mattfor/relaxy/additions/var
 chown "$SERVICE_USER":"$SERVICE_USER" /home/mattfor/relaxy/additions/var
-for binary in relaxy-health relaxy-watchdog ssh-priority; do
+for binary in relaxy-health relaxy-watchdog ssh-priority etb-sandbox; do
     chmod 0755 "$SRC/bin/$binary"
 done
 ok "binaries marked executable (they run from $SRC/bin)"
+
+if ! command -v bwrap >/dev/null 2>&1; then
+    warn "bubblewrap is not installed - the ETB bot will start UNSANDBOXED (xbps-install bubblewrap)"
+else
+    ok "bubblewrap present ($(bwrap --version)) - the ETB bot will start sandboxed"
+fi
 
 say "Installing runit services"
 

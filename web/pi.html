@@ -320,6 +320,25 @@
             margin-left: 5px;
         }
 
+        .svc-name .chip {
+            display: inline-block;
+            vertical-align: 1px;
+            margin-left: 6px;
+            padding: 1px 6px;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            font-size: 0.6rem;
+            font-weight: 600;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            color: var(--text-muted);
+        }
+
+        .svc-name .chip.is-loose {
+            color: var(--warning);
+            border-color: var(--warning);
+        }
+
         .svc-detail {
             font-size: 0.75rem;
             color: var(--text-muted);
@@ -734,6 +753,17 @@
             ? 'is-offline'
             : 'is-unknown');
 
+    const sandboxChip = (service) =>
+    {
+        const sandboxed = service.meta?.sandboxed;
+
+        if (sandboxed === true)
+        { return '<span class="chip" title="running inside a bubblewrap sandbox">sandboxed</span>'; }
+        if (sandboxed === false)
+        { return '<span class="chip is-loose" title="running OUTSIDE its bubblewrap sandbox">unconfined</span>'; }
+        return '';
+    };
+
     const renderAlerts = (data) =>
     {
         const out = [];
@@ -870,7 +900,7 @@
                 <div class="svc-main">
                     <div class="svc-name">${esc(service.name)}${service.critical
                     ? '<span class="crit" title="critical service">&#9733;</span>'
-                    : ''}</div>
+                    : ''}${sandboxChip(service)}</div>
                     <div class="svc-detail">${esc(service.detail ?? '')}${service.latencyMs != null
                     ? ` &middot; ${service.latencyMs}ms`
                     : ''} &middot; ${fmtAgo(service.since)}</div>

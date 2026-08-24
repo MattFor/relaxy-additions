@@ -14,7 +14,7 @@ to show off how well the entire ecosystem makes sure that nothing remains broken
 
 | Path                            | What it does                                                                                                                |
 |---------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
-| `bin/relaxy-health`             | Probes all 20 services, publishes three JSON feeds.                                                                         |
+| `bin/relaxy-health`             | Probes every service on the box, publishes three JSON feeds.                                                                |
 | `bin/relaxy-watchdog`           | Pets `/dev/watchdog`; runs health gates. (root)                                                                             |
 | `bin/ssh-priority`              | Keeps sshd at top CPU/IO/OOM priority; loads the nft table. (root)                                                          |
 | `lib/uptime-history.js`         | The uptime ledger: day buckets, incident detection, cause inference.                                                        |
@@ -22,6 +22,7 @@ to show off how well the entire ecosystem makes sure that nothing remains broken
 | `bin/incident`                  | Declares / annotates an outage. Symlinked to `/usr/local/bin/incident`.                                                     |
 | `bin/relaxy-uptime-seed`        | One-time backfill of history from existing `since` timestamps.                                                              |
 | `bin/zram-swap`                 | Creates and reports the compressed RAM swap device. (root)                                                                  |
+| `bin/etb-sandbox`               | Runs the ETB speedrun bot in a bubblewrap container.                                                                        |
 | `bin/apply-crash-fixes.sh`      | Boot config: reduced overclock, panic timeouts, shutdown watchdog arming.                                                   |
 | `bin/build-error-page.mjs`      | Builds `error.html` from the dashboard's own CSS. (In case I change something and don't want to rewite the whole page again |
 | `status/main.mjs`               | Reads the bot fleet out of MongoDB into `status.json`.                                                                      |
