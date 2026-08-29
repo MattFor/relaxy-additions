@@ -28,6 +28,11 @@ DNS_PROBE_NAME="relaxy.xyz"
 MIN_MEM_AVAILABLE_KB=131072
 MAX_LOADAVG=40
 SERVICE_USER=mattfor
+MEM_MIN_HEADROOM_KB=262144
+MEM_PSI_FULL_AVG60_MAX=25
+ZRAM_HEADROOM_PERCENT=40
+VITALS_EVERY=20
+TOP_RSS_COUNT=8
 
 [ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
@@ -121,11 +126,146 @@ gate_ssh()
     timeout 5 ss -tln "sport = :${SSH_PORT}" 2>/dev/null | grep -q LISTEN
 }
 
+MEM_TOTAL_KB=0
+MEM_FREE_KB=0
+MEM_AVAILABLE_KB=0
+MEM_CACHED_KB=0
+MEM_DIRTY_KB=0
+MEM_WRITEBACK_KB=0
+MEM_ANON_KB=0
+MEM_SLAB_KB=0
+MEM_SWAP_TOTAL_KB=0
+MEM_SWAP_FREE_KB=0
+MEM_SWAP_USED_KB=0
+MEM_SWAP_USABLE_KB=0
+MEM_HEADROOM_KB=0
+MEM_ZRAM=0
+MEM_ZRAM_GAIN=0
+MEM_ZRAM_RATIO="n/a"
+MEM_PSI=0
+MEM_PSI_SOME60="0.00"
+MEM_PSI_FULL10="0.00"
+MEM_PSI_FULL60="0.00"
+MEM_PSI_FULL300="0.00"
+
+mem_facts()
+{
+    local k v
+    while read -r k v _; do
+        case "$k" in
+            MemTotal:)     MEM_TOTAL_KB="$v" ;;
+            MemFree:)      MEM_FREE_KB="$v" ;;
+            MemAvailable:) MEM_AVAILABLE_KB="$v" ;;
+            Cached:)       MEM_CACHED_KB="$v" ;;
+            Dirty:)        MEM_DIRTY_KB="$v" ;;
+            Writeback:)    MEM_WRITEBACK_KB="$v" ;;
+            AnonPages:)    MEM_ANON_KB="$v" ;;
+            Slab:)         MEM_SLAB_KB="$v" ;;
+            SwapTotal:)    MEM_SWAP_TOTAL_KB="$v" ;;
+            SwapFree:)     MEM_SWAP_FREE_KB="$v" ;;
+        esac
+    done < /proc/meminfo 2>/dev/null
+
+    MEM_SWAP_USED_KB=$(( MEM_SWAP_TOTAL_KB - MEM_SWAP_FREE_KB ))
+
+    MEM_ZRAM=0
+    MEM_ZRAM_GAIN="$ZRAM_HEADROOM_PERCENT"
+    MEM_ZRAM_RATIO="n/a"
+
+    if grep -q '^/dev/zram' /proc/swaps 2>/dev/null; then
+        MEM_ZRAM=1
+
+        local orig=0 compr=0 used=0 o c u f
+        for f in /sys/block/zram*/mm_stat; do
+            [ -r "$f" ] || continue
+            read -r o c u _ < "$f" 2>/dev/null || continue
+            orig=$(( orig + ${o:-0} ))
+            compr=$(( compr + ${c:-0} ))
+            used=$(( used + ${u:-0} ))
+        done
+
+        if [ "$orig" -gt 16777216 ] && [ "$used" -gt 0 ] && [ "$used" -lt "$orig" ]; then
+            MEM_ZRAM_GAIN=$(( (orig - used) * 100 / orig ))
+            [ "$compr" -gt 0 ] && MEM_ZRAM_RATIO="$(( orig * 100 / compr ))"
+        fi
+    fi
+
+    if [ "$MEM_ZRAM" = "1" ]; then
+        MEM_SWAP_USABLE_KB=$(( MEM_SWAP_FREE_KB * MEM_ZRAM_GAIN / 100 ))
+    else
+        MEM_SWAP_USABLE_KB="$MEM_SWAP_FREE_KB"
+    fi
+
+    MEM_HEADROOM_KB=$(( MEM_AVAILABLE_KB + MEM_SWAP_USABLE_KB ))
+
+    MEM_PSI=0
+    if [ -r /proc/pressure/memory ]; then
+        local tag a10 a60 a300
+        while read -r tag a10 a60 a300 _; do
+            case "$tag" in
+                some) MEM_PSI=1; MEM_PSI_SOME60="${a60#avg60=}" ;;
+                full) MEM_PSI_FULL10="${a10#avg10=}"
+                      MEM_PSI_FULL60="${a60#avg60=}"
+                      MEM_PSI_FULL300="${a300#avg300=}" ;;
+            esac
+        done < /proc/pressure/memory 2>/dev/null
+    fi
+}
+
+psi_centi()
+{
+    local v="${1:-0}" i f
+    i="${v%%.*}"
+    f="${v#*.}"
+    [ "$f" = "$v" ] && f="00"
+    f="${f}00"
+    f="${f:0:2}"
+    printf '%d' "$(( 10#${i:-0} * 100 + 10#${f} ))"
+}
+
+mb() { printf '%d' "$(( ${1:-0} / 1024 ))"; }
+
+mem_line()
+{
+    printf 'headroom %sMB (avail %sMB + swap %sMB of %sMB free, %s); total %sMB, free %sMB, anon %sMB, cache %sMB, slab %sMB, dirty %sMB, writeback %sMB; swap used %sMB; PSI full 10/60/300 %s/%s/%s some60 %s' \
+        "$(mb "$MEM_HEADROOM_KB")" "$(mb "$MEM_AVAILABLE_KB")" "$(mb "$MEM_SWAP_USABLE_KB")" "$(mb "$MEM_SWAP_FREE_KB")" \
+        "$([ "$MEM_ZRAM" = "1" ] && printf 'zram gain %s%%, ratio %s' "$MEM_ZRAM_GAIN" "$MEM_ZRAM_RATIO" || printf 'disk swap')" \
+        "$(mb "$MEM_TOTAL_KB")" "$(mb "$MEM_FREE_KB")" "$(mb "$MEM_ANON_KB")" "$(mb "$MEM_CACHED_KB")" \
+        "$(mb "$MEM_SLAB_KB")" "$(mb "$MEM_DIRTY_KB")" "$(mb "$MEM_WRITEBACK_KB")" "$(mb "$MEM_SWAP_USED_KB")" \
+        "$MEM_PSI_FULL10" "$MEM_PSI_FULL60" "$MEM_PSI_FULL300" "$MEM_PSI_SOME60"
+}
+
+top_rss()
+{
+    local n="${1:-$TOP_RSS_COUNT}"
+    ps -eo rss=,pid=,comm= --sort=-rss 2>/dev/null \
+        | awk -v n="$n" 'NR<=n { printf "%s%s[%s] %dMB", (NR>1 ? ", " : ""), $3, $2, $1/1024 } END { printf "\n" }'
+}
+
+soc_temp()
+{
+    local t
+    read -r t < /sys/class/thermal/thermal_zone0/temp 2>/dev/null || { printf 'n/a'; return; }
+    printf '%d.%dC' "$(( t / 1000 ))" "$(( (t % 1000) / 100 ))"
+}
+
 gate_memory()
 {
-    local available
-    available=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)
-    [ -n "$available" ] && [ "$available" -gt "$MIN_MEM_AVAILABLE_KB" ]
+    mem_facts
+
+    if [ "$MEM_HEADROOM_KB" -le "$MEM_MIN_HEADROOM_KB" ]; then
+        return 1
+    fi
+
+    if [ "$MEM_PSI" = "1" ]; then
+        local now max
+        now=$(psi_centi "$MEM_PSI_FULL60")
+        max=$(( MEM_PSI_FULL_AVG60_MAX * 100 ))
+
+        [ "$now" -ge "$max" ] && return 1
+    fi
+
+    return 0
 }
 
 gate_load()
@@ -138,6 +278,50 @@ gate_load()
 gate_fork()
 {
     timeout 5 /bin/true 2>/dev/null
+}
+
+gate_detail()
+{
+    local gate="$1"
+
+    case "$gate" in
+        memory)
+            clog INFO "  memory: $(mem_line)"
+            clog INFO "  memory: thresholds - headroom floor $(mb "$MEM_MIN_HEADROOM_KB")MB, PSI full avg60 ceiling ${MEM_PSI_FULL_AVG60_MAX}.00%"
+            clog INFO "  memory: top rss - $(top_rss)"
+            ;;
+
+        load)
+            local l1 l5 l15 procs
+            read -r l1 l5 l15 procs _ < /proc/loadavg
+            clog INFO "  load: ${l1}/${l5}/${l15} (ceiling ${MAX_LOADAVG}), runnable ${procs}, $(nproc 2>/dev/null || echo '?') cpus, temp $(soc_temp)"
+            [ -r /proc/pressure/cpu ] && clog INFO "  load: PSI cpu $(tr '\n' ' ' < /proc/pressure/cpu)"
+            [ -r /proc/pressure/io ] && clog INFO "  load: PSI io $(tr '\n' ' ' < /proc/pressure/io)"
+            clog INFO "  load: top cpu - $(ps -eo pcpu=,pid=,comm= --sort=-pcpu 2>/dev/null | awk 'NR<=5 { printf "%s%s[%s] %s%%", (NR>1 ? ", " : ""), $3, $2, $1 } END { printf "\n" }')"
+            ;;
+
+        dns)
+            clog INFO "  dns: probe '${DNS_PROBE_NAME}' via 127.0.0.1"
+            clog INFO "  dns: $(timeout 5 drill "@127.0.0.1" "$DNS_PROBE_NAME" A 2>&1 | grep -E '^;; (flags|rcode|Query time|SERVER)' | tr '\n' ' ' || printf 'no response')"
+            clog INFO "  dns: listeners - $(timeout 5 ss -ulnp 'sport = :53' 2>/dev/null | tail -n +2 | wc -l) on udp/53"
+            ;;
+
+        filesystem)
+            clog INFO "  filesystem: root $(awk '$2 == "/" { print $3, $4 }' /proc/mounts)"
+            clog INFO "  filesystem: $(df -h / /run 2>/dev/null | tail -n +2 | tr '\n' ' ')"
+            clog INFO "  filesystem: inodes $(df -i / 2>/dev/null | awk 'NR==2 { print $5" used" }'), ext4 errors_count $(cat /sys/fs/ext4/*/errors_count 2>/dev/null | tr '\n' ' ')"
+            ;;
+
+        ssh)
+            clog INFO "  ssh: expecting a listener on ${SSH_PORT}"
+            clog INFO "  ssh: $(timeout 5 ss -tlnp "sport = :${SSH_PORT}" 2>/dev/null | tail -n +2 | tr -s ' ' | tr '\n' ' ' || printf 'nothing listening')"
+            ;;
+
+        fork)
+            clog INFO "  fork: $(ls /proc 2>/dev/null | grep -c '^[0-9]') processes, threads-max $(cat /proc/sys/kernel/threads-max 2>/dev/null), pid_max $(cat /proc/sys/kernel/pid_max 2>/dev/null)"
+            clog INFO "  fork: $(mem_line)"
+            ;;
+    esac
 }
 
 remediate()
@@ -176,11 +360,19 @@ remediate()
             gate_ssh
             ;;
         memory)
-            clog WARN "gate 'memory': dropping clean page cache" warning
+            clog WARN "gate 'memory': syncing and dropping clean page cache" warning
+            clog WARN "gate 'memory': before - $(mem_line)" warning
+            clog WARN "gate 'memory': holders - $(top_rss $(( TOP_RSS_COUNT * 2 )))" warning
+
             sync
-            echo 1 > /proc/sys/vm/drop_caches 2>/dev/null
+            echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
             sleep 5
+
             gate_memory
+            local rc=$?
+
+            clog WARN "gate 'memory': after - $(mem_line)" warning
+            return "$rc"
             ;;
         *)
             return 1
@@ -194,6 +386,8 @@ checker_main()
     declare -A remediations=()
     declare -A ever_passed=()
     declare -A gave_up=()
+
+    local checks=0
 
     for gate in $GATES; do
         failures[$gate]=0
@@ -223,6 +417,19 @@ checker_main()
 
         local in_grace=0
         [ "$up" -lt "$GRACE_SECONDS" ] && in_grace=1
+
+        checks=$(( checks + 1 ))
+
+        if [ "$VITALS_EVERY" -gt 0 ] && [ $(( checks % VITALS_EVERY )) -eq 0 ]; then
+            mem_facts
+
+            local vl1 vl5 vl15 vprocs
+            read -r vl1 vl5 vl15 vprocs _ < /proc/loadavg
+
+            clog INFO "vitals: up ${up}s, load ${vl1}/${vl5}/${vl15}, runnable ${vprocs}, temp $(soc_temp)"
+            clog INFO "vitals: $(mem_line)"
+            clog INFO "vitals: top rss - $(top_rss)"
+        fi
 
         local failing=""
 
@@ -257,6 +464,7 @@ checker_main()
             failing="$gate"
 
             clog WARN "gate '${gate}' failed (${failures[$gate]}/${FAIL_THRESHOLD})" warning
+            gate_detail "$gate"
 
             if [ "${failures[$gate]}" -eq $(( (FAIL_THRESHOLD + 1) / 2 )) ]; then
                 if remediate "$gate" "${remediations[$gate]}"; then
@@ -277,6 +485,8 @@ checker_main()
                     gave_up[$gate]=0
                 else
                     clog ERROR "gate '${gate}' failed ${failures[$gate]} consecutive checks - requesting graceful reboot" err
+                    clog ERROR "final state before reboot follows" err
+                    gate_detail "$gate"
                     printf 'reboot:%s\n' "$gate" > "$VERDICT_FILE"
                 fi
             fi
@@ -313,6 +523,23 @@ publish_state()
         done
 
         printf '\n  },\n'
+
+        printf '  "memory": {\n'
+        printf '    "totalMb": %s,\n'      "$(mb "$MEM_TOTAL_KB")"
+        printf '    "availableMb": %s,\n'  "$(mb "$MEM_AVAILABLE_KB")"
+        printf '    "headroomMb": %s,\n'   "$(mb "$MEM_HEADROOM_KB")"
+        printf '    "headroomFloorMb": %s,\n' "$(mb "$MEM_MIN_HEADROOM_KB")"
+        printf '    "swapFreeMb": %s,\n'   "$(mb "$MEM_SWAP_FREE_KB")"
+        printf '    "swapUsedMb": %s,\n'   "$(mb "$MEM_SWAP_USED_KB")"
+        printf '    "swapUsableMb": %s,\n' "$(mb "$MEM_SWAP_USABLE_KB")"
+        printf '    "zram": %s,\n'         "$([ "$MEM_ZRAM" = "1" ] && echo true || echo false)"
+        printf '    "zramGainPercent": %s,\n' "$MEM_ZRAM_GAIN"
+        printf '    "psiFullAvg10": %s,\n'  "$MEM_PSI_FULL10"
+        printf '    "psiFullAvg60": %s,\n'  "$MEM_PSI_FULL60"
+        printf '    "psiFullAvg300": %s,\n' "$MEM_PSI_FULL300"
+        printf '    "psiCeiling": %s\n'     "$MEM_PSI_FULL_AVG60_MAX"
+        printf '  },\n'
+
         printf '  "failing": "%s"\n' "$failing"
         printf '}\n'
     } > "$tmp" 2>/dev/null && mv "$tmp" "$STATE_FILE" 2>/dev/null
